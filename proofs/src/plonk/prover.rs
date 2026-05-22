@@ -100,13 +100,18 @@ where
 
     let domain = &pk.vk.domain;
 
+    log_phase("trace.compute_instances.start");
     let instance = compute_instances(params, pk, instances, nb_committed_instances, transcript)?;
+    log_phase("trace.compute_instances.end");
 
+    log_phase("trace.parse_advices.start");
     let (advice, challenges) = parse_advices(params, pk, circuits, instances, transcript, rng)?;
+    log_phase("trace.parse_advices.end");
 
     // Sample theta challenge for keeping lookup columns linearly independent
     let theta: F = transcript.squeeze_challenge();
 
+    log_phase("trace.lookups_permuted.start");
     let lookups: Vec<Vec<lookup::prover::Permuted<F>>> = instance
         .iter()
         .zip(advice.iter())
@@ -134,12 +139,15 @@ where
         })
         .collect::<Result<Vec<_>, _>>()?;
 
+    log_phase("trace.lookups_permuted.end");
+
     // Sample beta challenge
     let beta: F = transcript.squeeze_challenge();
 
     // Sample gamma challenge
     let gamma: F = transcript.squeeze_challenge();
 
+    log_phase("trace.permutations_commit.start");
     // Commit to permutations.
     let permutations: Vec<permutation::prover::Committed<F>> = instance
         .iter()
@@ -160,6 +168,9 @@ where
         })
         .collect::<Result<Vec<_>, _>>()?;
 
+    log_phase("trace.permutations_commit.end");
+
+    log_phase("trace.lookups_product.start");
     let lookups: Vec<Vec<lookup::prover::Committed<F>>> = lookups
         .into_iter()
         .map(|lookups| -> Result<Vec<_>, _> {
@@ -170,6 +181,7 @@ where
                 .collect::<Result<Vec<_>, _>>()
         })
         .collect::<Result<Vec<_>, _>>()?;
+    log_phase("trace.lookups_product.end");
 
     // Trash argument
     let trash_challenge: F = transcript.squeeze_challenge();
@@ -239,6 +251,112 @@ where
 /// parameters `params` and the proving key [`ProvingKey`] that was
 /// generated previously for the same circuit. The provided `instances`
 /// are zero-padded internally.
+/// Sample `(VmRSS, VmHWM)` in KiB from `/proc/self/status`. Returns
+/// `None` on non-Linux/Android targets. Used by [`log_phase`] to
+/// emit per-phase memory snapshots through the `midnight_bench`
+/// tracing target — the dioxus-wallet `BenchStageLayer` captures
+/// these and renders them in the Benchmark tab stage pill, plus
+/// they appear as ordinary entries in the Logs tab.
+///
+/// Reading `/proc/self/status` is cheap (single syscall, ~few KiB
+/// of kernel text), so we can call this freely at phase boundaries
+/// without measurable wall-clock overhead.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn sample_rss_hwm_kb() -> Option<(u64, u64)> {
+    let s = std::fs::read_to_string("/proc/self/status").ok()?;
+    let mut rss: Option<u64> = None;
+    let mut hwm: Option<u64> = None;
+    for line in s.lines() {
+        if let Some(v) = line.strip_prefix("VmRSS:") {
+            rss = v.split_whitespace().next().and_then(|n| n.parse().ok());
+        } else if let Some(v) = line.strip_prefix("VmHWM:") {
+            hwm = v.split_whitespace().next().and_then(|n| n.parse().ok());
+        }
+    }
+    rss.zip(hwm)
+}
+
+/// macOS / iOS path. There's no `/proc`; use the libc-ish
+/// `mach_task_basic_info` via `getrusage(RUSAGE_SELF)`. Same
+/// `(rss_kb, peak_kb)` return shape so callers don't branch.
+/// We can't read crate-level deps cleanly here, so call libc
+/// directly via the link-shim that ships with the Rust runtime.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn sample_rss_hwm_kb() -> Option<(u64, u64)> {
+    // SAFETY: `getrusage` is async-signal-safe and pure-read; the
+    // `rusage` struct is zero-init then filled by the kernel.
+    #[allow(unsafe_code)]
+    unsafe {
+        extern "C" {
+            fn getrusage(who: i32, usage: *mut Rusage) -> i32;
+        }
+        #[repr(C)]
+        struct Timeval { tv_sec: i64, tv_usec: i32 }
+        #[repr(C)]
+        struct Rusage {
+            ru_utime: Timeval,
+            ru_stime: Timeval,
+            ru_maxrss: i64,        // bytes on macOS
+            ru_ixrss: i64,
+            ru_idrss: i64,
+            ru_isrss: i64,
+            ru_minflt: i64,
+            ru_majflt: i64,
+            ru_nswap: i64,
+            ru_inblock: i64,
+            ru_oublock: i64,
+            ru_msgsnd: i64,
+            ru_msgrcv: i64,
+            ru_nsignals: i64,
+            ru_nvcsw: i64,
+            ru_nivcsw: i64,
+        }
+        let mut u: Rusage = std::mem::zeroed();
+        if getrusage(0 /* RUSAGE_SELF */, &mut u) != 0 {
+            return None;
+        }
+        // macOS reports `ru_maxrss` in bytes. Convert to KiB to
+        // match the Linux semantics. We don't have a true "current
+        // RSS" — `ru_maxrss` is the high-water mark — so report it
+        // as both rss and hwm; callers see them tracking the same.
+        let hwm_kb = (u.ru_maxrss as u64) / 1024;
+        Some((hwm_kb, hwm_kb))
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios")))]
+fn sample_rss_hwm_kb() -> Option<(u64, u64)> {
+    None
+}
+
+/// Emit a phase-marker tracing event. Captured by both
+/// `WalletLogLayer` (→ Logs tab + redb persistence) and
+/// `BenchStageLayer` (→ live stage pill on the Benchmark tab).
+/// `rss_mb` is the live resident set size at the moment of the
+/// call; `hwm_mb` is the high-water mark across the process
+/// lifetime so far. Together they show which phase is responsible
+/// for each step-up in peak memory.
+fn log_phase(name: &'static str) {
+    if let Some((rss_kb, hwm_kb)) = sample_rss_hwm_kb() {
+        tracing::info!(
+            target: "midnight_bench",
+            stage = name,
+            rss_mb = rss_kb / 1024,
+            hwm_mb = hwm_kb / 1024,
+        );
+    } else {
+        tracing::info!(target: "midnight_bench", stage = name);
+    }
+}
+
+/// `log_phase` exposed for `keygen.rs` (sibling module under `plonk`)
+/// without changing visibility on the underlying helpers. Same
+/// behaviour; same low-cost `/proc/self/status` read.
+#[doc(hidden)]
+pub(crate) fn log_phase_pub(name: &'static str) {
+    log_phase(name)
+}
+
 pub(crate) fn finalise_proof<'a, F, CS: PolynomialCommitmentScheme<F>, T: Transcript>(
     params: &'a CS::Parameters,
     pk: &'a ProvingKey<F, CS>,
@@ -264,7 +382,9 @@ where
 
     let domain = pk.get_vk().get_domain();
 
+    log_phase("finalise.compute_h_poly.start");
     let h_poly = compute_h_poly(pk, &trace);
+    log_phase("finalise.compute_h_poly.end");
 
     let ProverTrace {
         advice_polys,
@@ -277,7 +397,9 @@ where
     } = trace;
 
     // Construct the vanishing argument's h(X) commitments
+    log_phase("finalise.vanishing_construct.start");
     let vanishing = vanishing.construct::<CS, T>(params, domain, h_poly, rng, transcript)?;
+    log_phase("finalise.vanishing_construct.end");
 
     let x: F = transcript.squeeze_challenge();
 
@@ -323,6 +445,7 @@ where
         })
         .collect::<Result<Vec<_>, _>>()?;
 
+    log_phase("finalise.compute_queries.start");
     let queries = compute_queries(
         pk,
         nb_committed_instances,
@@ -334,8 +457,11 @@ where
         &vanishing,
         x,
     );
-
-    CS::multi_open(params, &queries, transcript).map_err(|_| Error::ConstraintSystemFailure)
+    log_phase("finalise.multi_open.start");
+    let res =
+        CS::multi_open(params, &queries, transcript).map_err(|_| Error::ConstraintSystemFailure);
+    log_phase("finalise.multi_open.end");
+    res
 }
 
 /// This creates a proof for the provided `circuit` when given the public
@@ -369,6 +495,7 @@ where
         + FromUniformBytes<64>,
 {
     let mut rng = rng;
+    log_phase("create_proof.compute_trace.start");
     let trace = compute_trace(
         params,
         pk,
@@ -379,7 +506,9 @@ where
         &mut rng,
         transcript,
     )?;
-    finalise_proof(
+    log_phase("create_proof.compute_trace.end");
+    log_phase("create_proof.finalise_proof.start");
+    let res = finalise_proof(
         params,
         pk,
         #[cfg(feature = "committed-instances")]
@@ -387,7 +516,9 @@ where
         trace,
         &mut rng,
         transcript,
-    )
+    );
+    log_phase("create_proof.finalise_proof.end");
+    res
 }
 
 pub(super) fn compute_instances<F, CS, T>(
