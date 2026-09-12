@@ -76,11 +76,10 @@ where
         // `&self.g` derefs to `&[E::G1]`; `g_to_lagrange` accepts a
         // slice. Wrap the produced `Vec` back into `BasesStorage`
         // so the lock's value type stays uniform.
-        self.g_lagrange
-            .get_or_init(|| {
-                let k = self.g.len().ilog2();
-                BasesStorage::owned(g_to_lagrange(&self.g, k))
-            })
+        self.g_lagrange.get_or_init(|| {
+            let k = self.g.len().ilog2();
+            BasesStorage::owned(g_to_lagrange(&self.g, k))
+        })
     }
 
     /// Release the cached Lagrange-basis SRS so the prover footprint
@@ -452,6 +451,7 @@ where
     // `from_raw_parts`-style slice construction. The invariants are
     // documented inline; see also `BasesStorage::mapped` SAFETY notes.
     #[allow(unsafe_code)]
+    #[cfg(feature = "mmap")]
     pub fn read_mmap_arc(mmap: std::sync::Arc<memmap2::Mmap>) -> io::Result<Self>
     where
         E::G2: ProcessedSerdeObject,
@@ -461,14 +461,20 @@ where
 
         let bytes: &[u8] = &mmap[..];
         if bytes.len() < HEADER_LEN {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "header truncated"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "header truncated",
+            ));
         }
         if &bytes[0..8] != MAGIC {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "bad magic"));
         }
         let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
         if version != 1 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "unsupported version"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported version",
+            ));
         }
         let _k = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
         let point_size = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize;
@@ -492,10 +498,13 @@ where
 
         // Validate ranges
         let g_end = g_off
-            .checked_add(g_count.checked_mul(point_size).unwrap_or(usize::MAX))
+            .checked_add(g_count.saturating_mul(point_size))
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "g range overflow"))?;
         if g_end > bytes.len() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "g overruns file"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "g overruns file",
+            ));
         }
         // Alignment check
         let g_ptr_addr = bytes.as_ptr() as usize + g_off;
@@ -505,12 +514,12 @@ where
                 "g not aligned to E::G1",
             ));
         }
-        let g_ptr = unsafe { (bytes.as_ptr() as *const u8).add(g_off) as *const E::G1 };
+        let g_ptr = unsafe { bytes.as_ptr().add(g_off) as *const E::G1 };
         let g = unsafe { BasesStorage::mapped(mmap.clone(), g_ptr, g_count) };
 
         let g_lagrange = if has_g_lagrange {
             let gl_end = gl_off
-                .checked_add(gl_count.checked_mul(point_size).unwrap_or(usize::MAX))
+                .checked_add(gl_count.saturating_mul(point_size))
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "gl range overflow"))?;
             if gl_end > bytes.len() {
                 return Err(io::Error::new(
@@ -525,8 +534,7 @@ where
                     "g_lagrange not aligned",
                 ));
             }
-            let gl_ptr =
-                unsafe { (bytes.as_ptr() as *const u8).add(gl_off) as *const E::G1 };
+            let gl_ptr = unsafe { bytes.as_ptr().add(gl_off) as *const E::G1 };
             let gl = unsafe { BasesStorage::mapped(mmap.clone(), gl_ptr, gl_count) };
             OnceLock::from(gl)
         } else {
@@ -542,7 +550,12 @@ where
         let g2 = E::G2::read(&mut g2_slice, SerdeFormat::RawBytesUnchecked)?;
         let s_g2 = E::G2::read(&mut s_g2_slice, SerdeFormat::RawBytesUnchecked)?;
 
-        Ok(Self { g, g_lagrange, g2, s_g2 })
+        Ok(Self {
+            g,
+            g_lagrange,
+            g2,
+            s_g2,
+        })
     }
 
     /// Writes the in-memory `ParamsKZG` to a companion file laid out
@@ -560,6 +573,7 @@ where
     // `#[repr(transparent)]` over a C-layout struct (verified for
     // midnight-curves' `G1Projective`).
     #[allow(unsafe_code)]
+    #[cfg(feature = "mmap")]
     pub fn write_mmap_companion<W: io::Write>(&self, writer: &mut W) -> io::Result<()>
     where
         E::G2: ProcessedSerdeObject,
@@ -612,7 +626,7 @@ where
         let g_bytes = unsafe {
             std::slice::from_raw_parts(
                 g_slice.as_ptr() as *const u8,
-                g_slice.len() * std::mem::size_of::<E::G1>(),
+                std::mem::size_of_val(g_slice),
             )
         };
         writer.write_all(g_bytes)?;
@@ -621,7 +635,7 @@ where
         let gl_bytes = unsafe {
             std::slice::from_raw_parts(
                 g_lagrange.as_ptr() as *const u8,
-                g_lagrange.len() * std::mem::size_of::<E::G1>(),
+                std::mem::size_of_val(g_lagrange),
             )
         };
         writer.write_all(gl_bytes)?;
@@ -741,7 +755,10 @@ mod test {
         assert_eq!(params0.g.len(), params1.g.len());
         // Materialise the Lagrange basis on both sides before comparing —
         // the field is `OnceLock` now, so we go through the lazy accessor.
-        assert_eq!(params0.g_lagrange_slice().len(), params1.g_lagrange_slice().len());
+        assert_eq!(
+            params0.g_lagrange_slice().len(),
+            params1.g_lagrange_slice().len()
+        );
 
         assert_eq!(params0.g, params1.g);
         assert_eq!(params0.g_lagrange_slice(), params1.g_lagrange_slice());
@@ -816,20 +833,19 @@ mod test {
     ///     equal the originals byte-for-byte;
     ///  3. The reconstructed `g` is genuinely backed by the mmap
     ///     (not silently copied into an owned `Vec`).
+    #[cfg(feature = "mmap")]
     #[test]
     fn test_mmap_companion_round_trip() {
         const K: u32 = 5;
+        use midnight_curves::Bls12;
         use std::io::Write as _;
         use std::sync::Arc;
-        use midnight_curves::Bls12;
 
         let params0: ParamsKZG<Bls12> = ParamsKZG::unsafe_setup(K, OsRng);
 
         // Write to a tempfile so we can mmap it back.
         let mut tmp = tempfile::NamedTempFile::new().expect("temp file");
-        params0
-            .write_mmap_companion(&mut tmp)
-            .expect("write companion");
+        params0.write_mmap_companion(&mut tmp).expect("write companion");
         tmp.flush().expect("flush");
         let file = tmp.reopen().expect("reopen");
         // SAFETY: we control the file lifecycle; mmap is read-only.
@@ -841,10 +857,7 @@ mod test {
         // Equality through the BasesStorage Deref → slice compare.
         assert_eq!(params0.g.len(), params1.g.len());
         assert_eq!(&*params0.g, &*params1.g);
-        assert_eq!(
-            params0.g_lagrange_slice(),
-            params1.g_lagrange_slice(),
-        );
+        assert_eq!(params0.g_lagrange_slice(), params1.g_lagrange_slice(),);
         assert_eq!(params0.g2, params1.g2);
         assert_eq!(params0.s_g2, params1.s_g2);
 
