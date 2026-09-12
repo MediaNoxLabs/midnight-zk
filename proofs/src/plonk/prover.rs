@@ -13,8 +13,9 @@ use rand_core::{CryptoRng, RngCore};
 // does inside `best_fft`. Sequential `.iter().map(coeff_to_extended)`
 // loops are the reason the effective core-count was ~2 of 11 rayon
 // threads in pre-experiment measurements.
-use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
+use super::cosets::{build_cosets, will_spill, Cosets};
 use super::{
     circuit::{
         sealed::{self},
@@ -305,12 +306,15 @@ fn sample_rss_hwm_kb() -> Option<(u64, u64)> {
             fn getrusage(who: i32, usage: *mut Rusage) -> i32;
         }
         #[repr(C)]
-        struct Timeval { tv_sec: i64, tv_usec: i32 }
+        struct Timeval {
+            tv_sec: i64,
+            tv_usec: i32,
+        }
         #[repr(C)]
         struct Rusage {
             ru_utime: Timeval,
             ru_stime: Timeval,
-            ru_maxrss: i64,        // bytes on macOS
+            ru_maxrss: i64, // bytes on macOS
             ru_ixrss: i64,
             ru_idrss: i64,
             ru_isrss: i64,
@@ -338,49 +342,14 @@ fn sample_rss_hwm_kb() -> Option<(u64, u64)> {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios")))]
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+)))]
 fn sample_rss_hwm_kb() -> Option<(u64, u64)> {
     None
-}
-
-/// Emit a phase-marker tracing event. Captured by both
-/// `WalletLogLayer` (→ Logs tab + redb persistence) and
-/// `BenchStageLayer` (→ live stage pill on the Benchmark tab).
-/// `rss_mb` is the live resident set size at the moment of the
-/// call; `hwm_mb` is the high-water mark across the process
-/// lifetime so far. Together they show which phase is responsible
-/// for each step-up in peak memory.
-/// Type alias for the cosets-spill use case. Cosets live in
-/// `ExtendedLagrangeCoeff` form, so the underlying generic holder
-/// is parameterised that way.
-///
-/// See [`super::mmap_pk::MmappedPolys`] for the implementation. The
-/// pattern (mmap'd tempfile + `ManuallyDrop` Polynomial views) is
-/// now the canonical spill primitive in this crate, reused both by
-/// the live coset-build path here and by the S5 PK-load path
-/// (`docs/k21-s5-mmap-pk-design.md`).
-pub(super) type SpilledCosets<F> = super::mmap_pk::MmappedPolys<F, ExtendedLagrangeCoeff>;
-
-/// Build the extended-domain coset for each input polynomial,
-/// streaming each to a tempfile and dropping it before the next is
-/// built — then mmap the tempfile and return Polynomial views.
-///
-/// Peak transient heap stays at ~1 coset (~`4n × size_of(F)` bytes).
-/// At k=20 with 50 fixed columns the per-column transient is ~128 MiB
-/// whereas the previous lazy `.collect()` held all 50 × 128 MiB =
-/// 6.4 GiB at once.
-pub(super) fn spill_cosets_to_disk<F>(
-    polys: &[Polynomial<F, Coeff>],
-    domain: &crate::poly::EvaluationDomain<F>,
-) -> std::io::Result<SpilledCosets<F>>
-where
-    F: WithSmallOrderMulGroup<3>,
-{
-    let coset_size = polys
-        .first()
-        .map(|_| 1usize << domain.extended_k())
-        .unwrap_or(0);
-    super::mmap_pk::spill_with_transform(polys, coset_size, |p| domain.coeff_to_extended(p.clone()))
 }
 
 // R3 — cooperative cancellation flag. The FFI host (or any other
@@ -409,6 +378,13 @@ pub static MIDNIGHT_CANCEL: std::sync::atomic::AtomicBool =
 /// of `ProverError::ProveFailed`.
 pub const MIDNIGHT_CANCEL_SENTINEL: &str = "MIDNIGHT_CANCELLED_BY_HOST";
 
+/// Emit a phase-marker tracing event. Captured by both
+/// `WalletLogLayer` (→ Logs tab + redb persistence) and
+/// `BenchStageLayer` (→ live stage pill on the Benchmark tab).
+/// `rss_mb` is the live resident set size at the moment of the
+/// call; `hwm_mb` is the high-water mark across the process
+/// lifetime so far. Together they show which phase is responsible
+/// for each step-up in peak memory.
 fn log_phase(name: &'static str) {
     // R3 — check cooperative cancellation flag first. If set,
     // panic with the sentinel — the FFI catch_unwind will
@@ -838,70 +814,43 @@ pub(super) fn compute_h_poly<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitm
     //
     // In-memory path stays the default for hosts with abundant RAM
     // (and for low-k where the spill IO overhead isn't worth it).
-    const DEFAULT_SPILL_FLOOR_K: u32 = 18;
-    let spill_floor_k: u32 = std::env::var("MIDNIGHT_SPILL_FLOOR_K")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_SPILL_FLOOR_K);
-    let want_spill_advice = matches!(
-        std::env::var("MIDNIGHT_SPILL_COSETS").as_deref(),
-        Ok("1") | Ok("true")
-    ) && pk.vk.domain.k() >= spill_floor_k;
-
-    enum CosetsForInstance<F: WithSmallOrderMulGroup<3>> {
-        InMem(Vec<Polynomial<F, ExtendedLagrangeCoeff>>),
-        Spilled(SpilledCosets<F>),
-    }
-    impl<F: WithSmallOrderMulGroup<3>> CosetsForInstance<F> {
-        fn as_slice(&self) -> &[Polynomial<F, ExtendedLagrangeCoeff>] {
-            match self {
-                Self::InMem(v) => v.as_slice(),
-                Self::Spilled(s) => s.as_slice(),
-            }
-        }
-    }
+    // `build_cosets` owns both the spill decision and the two arms, so
+    // these call sites carry no `cfg` and read no environment of their
+    // own. `will_spill` is asked only to narrate the choice: it answers
+    // for the capability as well as the switch, so a phase marker never
+    // reports a spill that the build could not have performed.
+    let k = pk.vk.domain.k();
+    let narrate_spill = will_spill(k);
 
     // Calculate the advice and instance cosets.
-    let advice_cosets: Vec<CosetsForInstance<F>> = advice_polys
+    let advice_cosets: Vec<Cosets<F>> = advice_polys
         .iter()
         .map(|advice_polys| {
-            if want_spill_advice {
+            if narrate_spill {
                 log_phase("finalise.compute_h_poly.spill_advice_cosets.start");
-                let s = spill_cosets_to_disk(advice_polys, &pk.vk.domain)
-                    .expect("spill advice_cosets to tempfile");
-                log_phase("finalise.compute_h_poly.spill_advice_cosets.end");
-                CosetsForInstance::Spilled(s)
-            } else {
-                CosetsForInstance::InMem(
-                    // par_iter (P1): column-level parallelism on top
-                    // of the inner FFT's own parallelism.
-                    advice_polys
-                        .par_iter()
-                        .map(|poly| pk.vk.get_domain().coeff_to_extended(poly.clone()))
-                        .collect(),
-                )
             }
+            let c = build_cosets(advice_polys, k, |poly| {
+                pk.vk.get_domain().coeff_to_extended(poly.clone())
+            });
+            if narrate_spill {
+                log_phase("finalise.compute_h_poly.spill_advice_cosets.end");
+            }
+            c
         })
         .collect();
-    let instance_cosets: Vec<CosetsForInstance<F>> = instance_polys
+    let instance_cosets: Vec<Cosets<F>> = instance_polys
         .iter()
         .map(|instance_polys| {
-            if want_spill_advice {
+            if narrate_spill {
                 log_phase("finalise.compute_h_poly.spill_instance_cosets.start");
-                let s = spill_cosets_to_disk(instance_polys, &pk.vk.domain)
-                    .expect("spill instance_cosets to tempfile");
-                log_phase("finalise.compute_h_poly.spill_instance_cosets.end");
-                CosetsForInstance::Spilled(s)
-            } else {
-                CosetsForInstance::InMem(
-                    // par_iter (P1): column-level parallelism on top
-                    // of the inner FFT's own parallelism.
-                    instance_polys
-                        .par_iter()
-                        .map(|poly| pk.vk.get_domain().coeff_to_extended(poly.clone()))
-                        .collect(),
-                )
             }
+            let c = build_cosets(instance_polys, k, |poly| {
+                pk.vk.get_domain().coeff_to_extended(poly.clone())
+            });
+            if narrate_spill {
+                log_phase("finalise.compute_h_poly.spill_instance_cosets.end");
+            }
+            c
         })
         .collect();
 
@@ -940,57 +889,53 @@ pub(super) fn compute_h_poly<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitm
     // function. Reuse `want_spill_advice` here as the shared spill
     // gate so all four coset categories (fixed/perm/advice/instance)
     // follow the same env-var contract.
-    let want_spill = want_spill_advice;
-
-    let computed_fixed_cosets;
-    let spilled_fixed_cosets;
+    let built_fixed_cosets;
     let fixed_cosets_ref: &[crate::poly::Polynomial<F, ExtendedLagrangeCoeff>] =
         if !pk.fixed_cosets.is_empty() {
             &pk.fixed_cosets
-        } else if want_spill {
-            log_phase("finalise.compute_h_poly.spill_fixed_cosets.start");
+        } else {
             // S5 (P2): read through `fixed_polys_slice()` so the
             // mmap-backed sidecar is consulted first when engaged.
-            spilled_fixed_cosets = spill_cosets_to_disk(pk.fixed_polys_slice(), &pk.vk.domain)
-                .expect("spill fixed_cosets to tempfile");
-            log_phase("finalise.compute_h_poly.spill_fixed_cosets.end");
-            spilled_fixed_cosets.as_slice()
-        } else {
-            log_phase("finalise.compute_h_poly.materialise_fixed_cosets.start");
-            // par_iter (P1) — read through `fixed_polys_slice()` so
-            // the S5 mmap-backed sidecar is consulted first.
-            computed_fixed_cosets = pk
-                .fixed_polys_slice()
-                .par_iter()
-                .map(|p| pk.vk.domain.coeff_to_extended(p.clone()))
-                .collect::<Vec<_>>();
-            log_phase("finalise.compute_h_poly.materialise_fixed_cosets.end");
-            &computed_fixed_cosets
+            // `build_cosets` picks the arm; the marker names stay split
+            // so downstream consumers that match on them see the same
+            // strings for the same behaviour as before.
+            log_phase(if narrate_spill {
+                "finalise.compute_h_poly.spill_fixed_cosets.start"
+            } else {
+                "finalise.compute_h_poly.materialise_fixed_cosets.start"
+            });
+            built_fixed_cosets = build_cosets(pk.fixed_polys_slice(), k, |p| {
+                pk.vk.domain.coeff_to_extended(p.clone())
+            });
+            log_phase(if narrate_spill {
+                "finalise.compute_h_poly.spill_fixed_cosets.end"
+            } else {
+                "finalise.compute_h_poly.materialise_fixed_cosets.end"
+            });
+            built_fixed_cosets.as_slice()
         };
 
-    let computed_perm_cosets;
-    let spilled_perm_cosets;
+    let built_perm_cosets;
     let perm_cosets_ref: &[crate::poly::Polynomial<F, ExtendedLagrangeCoeff>] =
         if !pk.permutation.cosets.is_empty() {
             &pk.permutation.cosets
-        } else if want_spill {
-            log_phase("finalise.compute_h_poly.spill_perm_cosets.start");
-            spilled_perm_cosets =
-                spill_cosets_to_disk(pk.permutation_polys_slice(), &pk.vk.domain)
-                    .expect("spill permutation cosets to tempfile");
-            log_phase("finalise.compute_h_poly.spill_perm_cosets.end");
-            spilled_perm_cosets.as_slice()
         } else {
-            log_phase("finalise.compute_h_poly.materialise_perm_cosets.start");
-            // par_iter (P1) — read through `permutation_polys_slice()`
-            // so the S5-P3 mmap-backed sidecar is consulted first.
-            computed_perm_cosets = pk
-                .permutation_polys_slice()
-                .par_iter()
-                .map(|p| pk.vk.domain.coeff_to_extended(p.clone()))
-                .collect::<Vec<_>>();
-            log_phase("finalise.compute_h_poly.materialise_perm_cosets.end");
-            &computed_perm_cosets
+            // Reads through `permutation_polys_slice()` so the S5-P3
+            // mmap-backed sidecar is consulted first.
+            log_phase(if narrate_spill {
+                "finalise.compute_h_poly.spill_perm_cosets.start"
+            } else {
+                "finalise.compute_h_poly.materialise_perm_cosets.start"
+            });
+            built_perm_cosets = build_cosets(pk.permutation_polys_slice(), k, |p| {
+                pk.vk.domain.coeff_to_extended(p.clone())
+            });
+            log_phase(if narrate_spill {
+                "finalise.compute_h_poly.spill_perm_cosets.end"
+            } else {
+                "finalise.compute_h_poly.materialise_perm_cosets.end"
+            });
+            built_perm_cosets.as_slice()
         };
 
     // Evaluate the h(X) polynomial
