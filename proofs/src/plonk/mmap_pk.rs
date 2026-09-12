@@ -271,12 +271,12 @@ pub fn spill_vec_to_disk<F, B>(
 pub fn spill_with_transform<F, In, Out, T>(
     inputs: &[Polynomial<F, In>],
     n_per_out_poly: usize,
-    mut transform: T,
+    transform: T,
 ) -> io::Result<MmappedPolys<F, Out>>
 where
     T: FnMut(&Polynomial<F, In>) -> Polynomial<F, Out>,
 {
-    spill_iter_to_disk(inputs.iter().map(|p| transform(p)), n_per_out_poly)
+    spill_iter_to_disk(inputs.iter().map(transform), n_per_out_poly)
 }
 
 // Integration tests against real `Polynomial<Fr, _>` values land in
@@ -285,3 +285,76 @@ where
 // so unit tests with synthetic field types can't run here either —
 // the consumer-side tests (smoke-test `proof_bytes` equality at
 // k=10..18 with/without S5) are the actual coverage.
+
+#[cfg(test)]
+mod test {
+    use midnight_curves::Fq as Fp;
+
+    use super::*;
+    use crate::poly::LagrangeCoeff;
+
+    fn poly(vals: &[u64]) -> Polynomial<Fp, LagrangeCoeff> {
+        Polynomial {
+            values: vals.iter().map(|v| Fp::from(*v)).collect(),
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    #[test]
+    fn spill_round_trips_values() {
+        let src = vec![poly(&[1, 2, 3, 4]), poly(&[5, 6, 7, 8])];
+        let expected: Vec<Vec<Fp>> = src.iter().map(|p| p.values.clone()).collect();
+
+        let spilled = spill_iter_to_disk(src, 4).unwrap();
+        let got = spilled.as_slice();
+
+        assert_eq!(got.len(), 2);
+        for (i, p) in got.iter().enumerate() {
+            assert_eq!(p.values.len(), 4, "poly {i} length");
+            assert_eq!(
+                p.values, expected[i],
+                "poly {i} values survived the round trip"
+            );
+        }
+    }
+
+    #[test]
+    fn spill_handles_the_empty_batch() {
+        let spilled: MmappedPolys<Fp, LagrangeCoeff> = spill_iter_to_disk(Vec::new(), 4).unwrap();
+        assert!(spilled.as_slice().is_empty());
+        // Dropping an empty mapping must not fault either.
+        drop(spilled);
+    }
+
+    #[test]
+    fn dropping_does_not_free_mmap_pages() {
+        // The module's central claim: the Polynomial views are ManuallyDrop, so
+        // the global allocator never sees a pointer it did not hand out. If that
+        // is wrong this aborts rather than failing, which is exactly why it is
+        // worth asserting rather than assuming.
+        for _ in 0..8 {
+            let spilled = spill_iter_to_disk(vec![poly(&[9, 9, 9, 9])], 4).unwrap();
+            assert_eq!(spilled.as_slice()[0].values[0], Fp::from(9u64));
+            drop(spilled);
+        }
+    }
+
+    #[test]
+    fn values_stay_readable_after_the_source_is_gone() {
+        // The source polynomials are consumed and dropped during the spill; the
+        // mapping must not alias their freed heap.
+        let spilled = {
+            let src = vec![poly(&[11, 22, 33, 44])];
+            spill_iter_to_disk(src, 4).unwrap()
+        };
+        assert_eq!(
+            spilled.as_slice()[0].values,
+            vec![
+                Fp::from(11u64),
+                Fp::from(22u64),
+                Fp::from(33u64),
+                Fp::from(44u64)
+            ]
+        );
+    }
+}

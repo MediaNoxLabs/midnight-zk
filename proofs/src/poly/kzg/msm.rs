@@ -221,7 +221,7 @@ pub fn msm_specific<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C::Curve]) ->
         for (c_chunk, b_chunk) in coeffs.chunks(chunk).zip(bases.chunks(chunk)) {
             let mut affine_chunk = vec![C::identity(); c_chunk.len()];
             C::Curve::batch_normalize(b_chunk, &mut affine_chunk);
-            acc = acc + msm_best(c_chunk, &affine_chunk);
+            acc += msm_best(c_chunk, &affine_chunk);
             // affine_chunk + msm_best's bases_local drop here, freeing
             // ~48 MiB before the next iteration allocates.
         }

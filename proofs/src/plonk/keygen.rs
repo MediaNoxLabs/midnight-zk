@@ -378,8 +378,11 @@ where
         // of keygen is typically immediately serialised and re-read
         // by the cache layer, so spilling now would waste a
         // roundtrip.
+        #[cfg(feature = "disk-spill")]
         fixed_polys_mmap: None,
+        #[cfg(feature = "disk-spill")]
         fixed_values_mmap: None,
+        #[cfg(feature = "disk-spill")]
         permutation_polys_mmap: None,
     })
 }
