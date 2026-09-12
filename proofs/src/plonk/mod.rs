@@ -28,12 +28,17 @@ use crate::{
 };
 
 mod circuit;
+/// Coset construction, spilling to disk when built to.
+pub mod cosets;
 mod error;
 pub(crate) mod evaluation;
 mod keygen;
 pub(crate) mod lookup;
 // S5 (P1, scaffold): mmap-backed PK loader infrastructure. Not yet
 // wired into ProvingKey::read — see docs/k21-s5-mmap-pk-design.md.
+// Spills batches of polynomials to a tempfile and maps them back, so
+// it needs both a filesystem to write to and `mmap(2)` to read from.
+#[cfg(feature = "disk-spill")]
 pub(crate) mod mmap_pk;
 pub mod permutation;
 pub(crate) mod traces;
@@ -353,13 +358,14 @@ pub struct ProvingKey<F: PrimeField, CS: PolynomialCommitmentScheme<F>> {
     /// and callers MUST read polynomials through
     /// [`ProvingKey::fixed_polys_slice`]. Wrapped in `Arc` so PK
     /// `clone()` shares the underlying mmap + tempfile.
+    #[cfg(feature = "disk-spill")]
     pub(crate) fixed_polys_mmap: Option<std::sync::Arc<mmap_pk::MmappedPolys<F, Coeff>>>,
 
     /// S5 (P3): optional mmap-backed view of `fixed_values`
     /// (LagrangeCoeff basis, ~640 MiB at k=21). Same semantics as
     /// `fixed_polys_mmap`. Read via [`ProvingKey::fixed_values_slice`].
-    pub(crate) fixed_values_mmap:
-        Option<std::sync::Arc<mmap_pk::MmappedPolys<F, LagrangeCoeff>>>,
+    #[cfg(feature = "disk-spill")]
+    pub(crate) fixed_values_mmap: Option<std::sync::Arc<mmap_pk::MmappedPolys<F, LagrangeCoeff>>>,
 
     /// S5 (P3): optional mmap-backed view of `permutation.polys`
     /// (Coeff basis, ~640 MiB at k=21). Same semantics as
@@ -367,8 +373,8 @@ pub struct ProvingKey<F: PrimeField, CS: PolynomialCommitmentScheme<F>> {
     /// [`ProvingKey::permutation_polys_slice`]. Lives at the
     /// top-level PK rather than inside `permutation::ProvingKey`
     /// to keep the permutation type clone-safe and small.
-    pub(crate) permutation_polys_mmap:
-        Option<std::sync::Arc<mmap_pk::MmappedPolys<F, Coeff>>>,
+    #[cfg(feature = "disk-spill")]
+    pub(crate) permutation_polys_mmap: Option<std::sync::Arc<mmap_pk::MmappedPolys<F, Coeff>>>,
 }
 
 // S5 (P2): bound-free impl so the accessor + spill are available
@@ -386,31 +392,35 @@ impl<F: PrimeField, CS: PolynomialCommitmentScheme<F>> ProvingKey<F, CS> {
     /// Callers that previously indexed `&pk.fixed_polys[i]` should
     /// now use `&pk.fixed_polys_slice()[i]`.
     pub(crate) fn fixed_polys_slice(&self) -> &[Polynomial<F, Coeff>] {
-        match self.fixed_polys_mmap.as_ref() {
-            Some(m) => m.as_slice(),
-            None => &self.fixed_polys,
+        #[cfg(feature = "disk-spill")]
+        if let Some(m) = self.fixed_polys_mmap.as_ref() {
+            return m.as_slice();
         }
+        &self.fixed_polys
     }
 
     /// S5 (P3): mirror of `fixed_polys_slice` for `fixed_values`.
     pub(crate) fn fixed_values_slice(&self) -> &[Polynomial<F, LagrangeCoeff>] {
-        match self.fixed_values_mmap.as_ref() {
-            Some(m) => m.as_slice(),
-            None => &self.fixed_values,
+        #[cfg(feature = "disk-spill")]
+        if let Some(m) = self.fixed_values_mmap.as_ref() {
+            return m.as_slice();
         }
+        &self.fixed_values
     }
 
     /// S5 (P3): mirror of `fixed_polys_slice` for `permutation.polys`.
     pub(crate) fn permutation_polys_slice(&self) -> &[Polynomial<F, Coeff>] {
-        match self.permutation_polys_mmap.as_ref() {
-            Some(m) => m.as_slice(),
-            None => &self.permutation.polys,
+        #[cfg(feature = "disk-spill")]
+        if let Some(m) = self.permutation_polys_mmap.as_ref() {
+            return m.as_slice();
         }
+        &self.permutation.polys
     }
 
     /// S5 (P2): Move `fixed_polys` into mmap-backed storage.
     /// See [`Self::spill_all_to_mmap`] for a one-shot variant that
     /// also handles `fixed_values` and `permutation.polys` (P3).
+    #[cfg(feature = "disk-spill")]
     pub fn spill_fixed_polys_to_mmap(&mut self) -> std::io::Result<()> {
         if self.fixed_polys_mmap.is_some() {
             return Ok(());
@@ -428,6 +438,7 @@ impl<F: PrimeField, CS: PolynomialCommitmentScheme<F>> ProvingKey<F, CS> {
     /// S5 (P3): Move `fixed_values` (LagrangeCoeff basis) into
     /// mmap-backed storage. Mirrors `spill_fixed_polys_to_mmap`.
     /// Target: ~640 MiB phys_footprint relief at k=21.
+    #[cfg(feature = "disk-spill")]
     pub fn spill_fixed_values_to_mmap(&mut self) -> std::io::Result<()> {
         if self.fixed_values_mmap.is_some() {
             return Ok(());
@@ -446,6 +457,7 @@ impl<F: PrimeField, CS: PolynomialCommitmentScheme<F>> ProvingKey<F, CS> {
     /// mmap-backed storage. Sidecar lives at the top-level PK so
     /// `permutation::ProvingKey` stays clone-safe and small.
     /// Target: ~640 MiB phys_footprint relief at k=21.
+    #[cfg(feature = "disk-spill")]
     pub fn spill_permutation_polys_to_mmap(&mut self) -> std::io::Result<()> {
         if self.permutation_polys_mmap.is_some() {
             return Ok(());
@@ -469,6 +481,7 @@ impl<F: PrimeField, CS: PolynomialCommitmentScheme<F>> ProvingKey<F, CS> {
     /// Combined target at k=21: ~2.6 GiB phys_footprint relief —
     /// pulls iOS below the iPhone 16 Pro jetsam threshold and
     /// makes real-device k=21 viable.
+    #[cfg(feature = "disk-spill")]
     pub fn spill_all_to_mmap(&mut self) -> std::io::Result<()> {
         self.spill_fixed_polys_to_mmap()?;
         self.spill_fixed_values_to_mmap()?;
@@ -556,6 +569,8 @@ where
         let permutation =
             permutation::ProvingKey::read(reader, format, &vk.domain, &vk.cs.permutation)?;
         let ev = Evaluator::new(vk.cs());
+        // Only the `disk-spill` path below mutates `pk`.
+        #[cfg_attr(not(feature = "disk-spill"), allow(unused_mut))]
         let mut pk = Self {
             vk,
             l0,
@@ -566,8 +581,11 @@ where
             fixed_cosets,
             permutation,
             ev,
+            #[cfg(feature = "disk-spill")]
             fixed_polys_mmap: None,
+            #[cfg(feature = "disk-spill")]
             fixed_values_mmap: None,
+            #[cfg(feature = "disk-spill")]
             permutation_polys_mmap: None,
         };
         // S5 (P2+P3): opt-in mmap-spill of fixed_polys +
@@ -579,6 +597,7 @@ where
         // (no `phys_footprint` contribution under the jetsam
         // metric). Failures are best-effort — earlier successful
         // spills are kept; subsequent ones return the io::Error.
+        #[cfg(feature = "disk-spill")]
         if matches!(std::env::var("MIDNIGHT_SPILL_PK").as_deref(), Ok("1")) {
             let _ = pk.spill_all_to_mmap();
         }
