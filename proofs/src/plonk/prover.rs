@@ -15,13 +15,13 @@ use rand_core::{CryptoRng, RngCore};
 // threads in pre-experiment measurements.
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
-use super::cosets::{build_cosets, will_spill, Cosets};
 use super::{
     circuit::{
         sealed::{self},
         Advice, Any, Assignment, Challenge, Circuit, Column, ConstraintSystem, Fixed, FloorPlanner,
         Instance, Selector,
     },
+    cosets::{build_cosets, will_spill, Cosets},
     lookup, permutation, vanishing, Error, ProvingKey,
 };
 #[cfg(feature = "committed-instances")]
@@ -858,16 +858,14 @@ pub(super) fn compute_nu_poly<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommit
     // Materialise the fixed + permutation cosets right before
     // `evaluate_h`. Two paths:
     //
-    // - `MIDNIGHT_SPILL_COSETS=1` — disk-backed: build each coset
-    //   one at a time, write to a tempfile, drop before the next.
-    //   Mmap the result. Peak in-memory transient per column.
-    //   Required for k ≥ 20 on phones where the full
-    //   `Vec<Polynomial>` (~6+ GiB at k=20) can't fit alongside
-    //   the existing prove working set.
+    // - `MIDNIGHT_SPILL_COSETS=1` — disk-backed: build each coset one at a time,
+    //   write to a tempfile, drop before the next. Mmap the result. Peak in-memory
+    //   transient per column. Required for k ≥ 20 on phones where the full
+    //   `Vec<Polynomial>` (~6+ GiB at k=20) can't fit alongside the existing prove
+    //   working set.
     //
-    // - default — in-memory `.collect()`: faster (~1 disk write
-    //   pass saved) but holds all cosets coresident. Fine through
-    //   k=19 on mobile, dies at k=20.
+    // - default — in-memory `.collect()`: faster (~1 disk write pass saved) but
+    //   holds all cosets coresident. Fine through k=19 on mobile, dies at k=20.
     //
     // Forward-compat: if the ProvingKey carries a pre-built
     // cached `fixed_cosets` / `permutation.cosets` (from an older

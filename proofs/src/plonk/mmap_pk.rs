@@ -43,14 +43,13 @@ use crate::poly::Polynomial;
 /// a non-owning view into a mmap'd tempfile.
 ///
 /// The struct holds three pieces, in this drop order:
-///   1. `polys` — `Vec<ManuallyDrop<Polynomial<F, B>>>`. Dropping the
-///      vec frees the outer Vec spine but does NOT run the inner
-///      Polynomial destructors (those would call `free` on mmap
-///      pointers).
-///   2. `_mmap` — `Arc<Mmap>`. When the refcount hits zero the OS
-///      unmaps the file pages.
-///   3. `_tmp_path` — `tempfile::TempPath`. Drop deletes the
-///      underlying file from disk.
+///   1. `polys` — `Vec<ManuallyDrop<Polynomial<F, B>>>`. Dropping the vec frees
+///      the outer Vec spine but does NOT run the inner Polynomial destructors
+///      (those would call `free` on mmap pointers).
+///   2. `_mmap` — `Arc<Mmap>`. When the refcount hits zero the OS unmaps the
+///      file pages.
+///   3. `_tmp_path` — `tempfile::TempPath`. Drop deletes the underlying file
+///      from disk.
 ///
 /// `Sync`/`Send`: the inner `Polynomial<F, B>` values are read-only
 /// views; the struct is `Send + Sync` whenever `F: Send + Sync` and

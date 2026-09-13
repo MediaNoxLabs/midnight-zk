@@ -231,7 +231,9 @@ fn msm_chunk_size() -> usize {
 /// every `chunk`. That is a property worth asserting rather than assuming —
 /// this sits on the `commit_lagrange` path, and an optimisation that quietly
 /// changed a commitment would still pass every other test in the suite.
-/// [`chunked_msm_agrees_with_unchunked`] is that assertion.
+/// `chunked_msm_agrees_with_unchunked` in this module's tests is that
+/// assertion. Named in prose rather than linked: it is `#[cfg(test)]`, so a
+/// doc build cannot resolve a link to it.
 fn msm_chunked<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C::Curve], chunk: usize) -> C::Curve {
     if coeffs.len() <= chunk {
         let mut affine_bases = vec![C::identity(); coeffs.len()];
