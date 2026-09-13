@@ -442,6 +442,85 @@ where
         Ok(())
     }
 
+    /// Read an SRS without parsing the Lagrange basis from the file.
+    ///
+    /// Same on-disk layout as [`read_custom`](Self::read_custom), but the
+    /// `g_lagrange` block is skipped and the basis recomputed from `g`. That
+    /// trades one inverse-NTT for the file read plus the intermediate buffer
+    /// the parse would have held alongside the result.
+    ///
+    /// The skip distance is derived from how many bytes reading `g` actually
+    /// consumed, rather than from a per-format point size. The three
+    /// `SerdeFormat`s encode points differently, and a hardcoded size would be
+    /// a silent mis-seek the moment a format changed — which would surface as
+    /// a corrupt `g2`, not as an error.
+    ///
+    /// # Not yet the full optimisation
+    ///
+    /// The fork this came from made `g_lagrange` a `OnceLock` so the FFT was
+    /// deferred until something actually asked for the Lagrange basis, and a
+    /// consumer that never did paid nothing. Upstream has since made the field
+    /// eager and added two derived bases, so genuine laziness now means
+    /// `OnceLock` on three fields and a `get_or_init` accessor — a deliberate
+    /// divergence from upstream's struct, tracked separately.
+    ///
+    /// What this gives today is the I/O saving, not the deferred-FFT saving.
+    /// Callers expecting peak heap to stay at 1× the SRS will not see that yet.
+    pub fn read_custom_lazy<R: io::Read + io::Seek>(
+        reader: &mut R,
+        format: SerdeFormat,
+    ) -> io::Result<Self>
+    where
+        E::G1Affine: SerdeObject,
+        E::G2: ProcessedSerdeObject,
+    {
+        let mut k_bytes = [0u8; 4];
+        reader.read_exact(&mut k_bytes[..])?;
+        let k = u32::from_le_bytes(k_bytes);
+        let n = 1usize << k;
+
+        let before_g = reader.stream_position()?;
+        let g: Vec<E::G1Affine> = match format {
+            SerdeFormat::Processed => {
+                let mut out = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let mut repr = <E::G1Affine as GroupEncoding>::Repr::default();
+                    reader.read_exact(repr.as_mut())?;
+                    let p: Option<E::G1Affine> = E::G1Affine::from_bytes(&repr).into();
+                    out.push(p.ok_or_else(|| io::Error::other("invalid point encoding"))?);
+                }
+                out
+            }
+            SerdeFormat::RawBytes => {
+                (0..n).map(|_| E::G1Affine::read_raw(reader)).collect::<Result<Vec<_>, _>>()?
+            }
+            SerdeFormat::RawBytesUnchecked => {
+                (0..n).map(|_| E::G1Affine::read_raw_unchecked(reader)).collect::<Vec<_>>()
+            }
+        };
+        let g_block = reader.stream_position()? - before_g;
+
+        // Skip the g_lagrange block: same element count, same encoding, so the
+        // same byte length as the block just read.
+        reader.seek(io::SeekFrom::Current(g_block as i64))?;
+
+        let g2 = E::G2::read(reader, format)?;
+        let s_g2 = E::G2::read(reader, format)?;
+
+        let g_lagrange = g_to_lagrange(&g, k);
+        let g_lagrange_delta = suffix_sum(&g_lagrange);
+        let g_lagrange_double_delta = suffix_sum(&g_lagrange_delta);
+
+        Ok(Self {
+            g: BasesStorage::owned(g),
+            g_lagrange: BasesStorage::owned(g_lagrange),
+            g_lagrange_delta: BasesStorage::owned(g_lagrange_delta),
+            g_lagrange_double_delta: BasesStorage::owned(g_lagrange_double_delta),
+            g2,
+            s_g2,
+        })
+    }
+
     /// Reads params from a buffer.
     pub fn read_custom<R: io::Read>(reader: &mut R, format: SerdeFormat) -> io::Result<Self>
     where
@@ -797,5 +876,44 @@ mod test {
             load(huge_count).is_err(),
             "count that overflows on multiply"
         );
+    }
+
+    #[test]
+    fn read_custom_lazy_matches_read_custom() {
+        // The lazy reader skips the g_lagrange block and recomputes it. If the
+        // seek distance were wrong the error would not be an error - it would
+        // be a corrupt g2 read from the middle of the Lagrange block, and a
+        // prover that produced garbage rather than failing.
+        use midnight_curves::Bls12;
+        let params = ParamsKZG::<Bls12>::unsafe_setup(4, OsRng);
+
+        for format in [SerdeFormat::RawBytes, SerdeFormat::RawBytesUnchecked] {
+            let mut buf = Vec::new();
+            params.write_custom(&mut buf, format).unwrap();
+
+            let eager = ParamsKZG::<Bls12>::read_custom(&mut &buf[..], format).unwrap();
+            let lazy =
+                ParamsKZG::<Bls12>::read_custom_lazy(&mut std::io::Cursor::new(&buf), format)
+                    .unwrap();
+
+            assert_eq!(&*lazy.g, &*eager.g, "{format:?}: g");
+            assert_eq!(
+                &*lazy.g_lagrange, &*eager.g_lagrange,
+                "{format:?}: g_lagrange recomputed"
+            );
+            assert_eq!(
+                &*lazy.g_lagrange_delta, &*eager.g_lagrange_delta,
+                "{format:?}: delta"
+            );
+            assert_eq!(
+                &*lazy.g_lagrange_double_delta, &*eager.g_lagrange_double_delta,
+                "{format:?}: double delta"
+            );
+            assert_eq!(
+                lazy.g2, eager.g2,
+                "{format:?}: g2 - a wrong seek corrupts this first"
+            );
+            assert_eq!(lazy.s_g2, eager.s_g2, "{format:?}: s_g2");
+        }
     }
 }
