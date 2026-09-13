@@ -74,7 +74,7 @@ where
     /// Internal hot-path accessor — `commit_lagrange` calls this rather
     /// than touching the field directly so the lazy-init contract is
     /// honoured uniformly.
-    pub fn g_lagrange_slice(&self) -> &[E::G1] {
+    pub(crate) fn g_lagrange_slice(&self) -> &[E::G1] {
         // `&self.g` derefs to `&[E::G1]`; `g_to_lagrange` accepts a
         // slice. Wrap the produced `Vec` back into `BasesStorage`
         // so the lock's value type stays uniform.
