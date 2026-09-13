@@ -232,11 +232,27 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      # fork-only: pin the formatter.
+      #
+      # `toolchain: nightly` installs whatever nightly exists on the day the
+      # job runs, so this check re-decides what "formatted" means every
+      # morning. The tree is formatted to roughly nightly-2026-03-08; against
+      # a September nightly, `--check` reports diffs in 130+ files across
+      # curves/, circuits/, aggregation/ and zk_stdlib/ — nearly all of them
+      # untouched by any branch. The job is red for everyone, and the only
+      # ways out are to reformat the whole repository or to pin.
+      #
+      # Pinned rather than reformatted: a patch set that rewrites 130 upstream
+      # files to chase a formatter is unreviewable, and it would go red again
+      # on the next rustfmt change anyway.
+      #
+      # Worth proposing upstream on its own merits — an unpinned formatter in
+      # CI breaks branches that changed nothing.
       - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb # nightly
         with:
-          toolchain: nightly
-      - run: rustup component add rustfmt --toolchain nightly
-      - run: cargo +nightly fmt --all -- --check
+          toolchain: nightly-2026-03-08
+          components: rustfmt
+      - run: cargo +nightly-2026-03-08 fmt --all -- --check
 
   clippy:
     if: github.event.pull_request.draft == false
