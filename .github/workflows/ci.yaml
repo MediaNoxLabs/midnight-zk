@@ -6,6 +6,17 @@ on:
     branches:
       - main
       - next
+      # fork-only: the `-patched` lines are long-lived branches pushed
+      # directly rather than through a PR, so neither trigger above fires
+      # on them. Without this the patch sets — which is where all the
+      # `unsafe` and all the prover changes live — carry no CI evidence
+      # at all. A glob rather than a list, so a new line is covered the
+      # day it is cut.
+      #
+      # Drop this entry when proposing the patch set upstream: it is
+      # infrastructure for how this fork is operated, not part of the
+      # change being proposed.
+      - '*-patched'
 
 jobs:
   download-srs:
