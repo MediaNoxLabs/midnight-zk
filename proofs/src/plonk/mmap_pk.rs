@@ -55,7 +55,7 @@ use crate::poly::Polynomial;
 /// views; the struct is `Send + Sync` whenever `F: Send + Sync` and
 /// `B: Send + Sync`. (The compiler derives these automatically from
 /// the field types.)
-pub struct MmappedPolys<F, B> {
+pub(crate) struct MmappedPolys<F, B> {
     polys: Vec<ManuallyDrop<Polynomial<F, B>>>,
     _mmap: Arc<memmap2::Mmap>,
     _tmp_path: tempfile::TempPath,
@@ -80,7 +80,7 @@ impl<F, B> MmappedPolys<F, B> {
     /// because `ManuallyDrop<T>` is `#[repr(transparent)]` over `T`
     /// and callers only get shared, read-only access (no moves or
     /// drops through the slice).
-    pub fn as_slice(&self) -> &[Polynomial<F, B>] {
+    pub(crate) fn as_slice(&self) -> &[Polynomial<F, B>] {
         // SAFETY: ManuallyDrop<T> is #[repr(transparent)]; layout is
         // identical to T. Shared borrow, no drops, no mutations.
         #[allow(unsafe_code)]
@@ -96,7 +96,7 @@ impl<F, B> MmappedPolys<F, B> {
     // P3 consumers (ProvingKey integration) call this; suppress the
     // dead-code warning while only the P1 surface ships.
     #[allow(dead_code)]
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.polys.len()
     }
 
@@ -104,7 +104,7 @@ impl<F, B> MmappedPolys<F, B> {
     // P3 consumers (ProvingKey integration) call this; suppress the
     // dead-code warning while only the P1 surface ships.
     #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.polys.is_empty()
     }
 }
@@ -149,7 +149,10 @@ fn make_tempfile() -> io::Result<tempfile::NamedTempFile> {
 ///
 /// Returns the underlying `io::Error` from tempfile creation, the
 /// write loop, the flush, or `Mmap::map`.
-pub fn spill_iter_to_disk<F, B, I>(polys: I, n_per_poly: usize) -> io::Result<MmappedPolys<F, B>>
+pub(crate) fn spill_iter_to_disk<F, B, I>(
+    polys: I,
+    n_per_poly: usize,
+) -> io::Result<MmappedPolys<F, B>>
 where
     I: IntoIterator<Item = Polynomial<F, B>>,
 {
@@ -245,7 +248,7 @@ where
 // P3 consumers (ProvingKey integration) call this; suppress the
 // dead-code warning while only the P1 surface ships.
 #[allow(dead_code)]
-pub fn spill_vec_to_disk<F, B>(
+pub(crate) fn spill_vec_to_disk<F, B>(
     mut polys: Vec<Polynomial<F, B>>,
     n_per_poly: usize,
 ) -> io::Result<MmappedPolys<F, B>> {
@@ -267,7 +270,7 @@ pub fn spill_vec_to_disk<F, B>(
 /// Inputs are taken by shared reference so the caller retains the
 /// originals (e.g. `pk.fixed_polys`, `pk.permutation.polys`) — the
 /// transform clones internally as needed.
-pub fn spill_with_transform<F, In, Out, T>(
+pub(crate) fn spill_with_transform<F, In, Out, T>(
     inputs: &[Polynomial<F, In>],
     n_per_out_poly: usize,
     transform: T,
