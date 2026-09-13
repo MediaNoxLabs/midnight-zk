@@ -1,6 +1,6 @@
 //! Per-phase memory instrumentation for the prover and keygen.
 //!
-//! [`log_phase`] emits a marker on the `midnight_bench` tracing target,
+//! `log_phase` emits a marker on the `midnight_bench` tracing target,
 //! carrying resident-set size and the process high-water mark where the
 //! platform can supply them. Paired `.start` / `.end` markers around each
 //! phase show *which* phase is responsible for each step-up in peak memory,

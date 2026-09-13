@@ -21,7 +21,8 @@
 //! `BasesStorage::Mapped` is sound only when constructed against a
 //! file whose bytes are a verbatim contiguous sequence of `C`s in
 //! the same memory layout the producer used. We control that
-//! format via [`write_mmap_companion`](crate::poly::kzg::params::ParamsKZG::write_mmap_companion);
+//! format via `ParamsKZG::write_mmap_companion` (not linked: it exists only
+//! under the `mmap` feature, so a default-feature doc build cannot resolve it);
 //! external callers must not feed arbitrary files to
 //! `read_mmap_arc`.
 //!
@@ -148,12 +149,12 @@ impl<C: 'static> BasesStorage<C> {
     ///
     /// 1. `ptr` points into the `mmap` region.
     /// 2. `ptr` has at least `align_of::<C>()` alignment.
-    /// 3. The `len * size_of::<C>()` bytes starting at `ptr` are
-    ///    a valid bit-pattern for `[C; len]` — i.e. the file was
-    ///    produced by serialising live `C` values via the same
-    ///    in-memory representation we're now claiming.
-    /// 4. The `Arc<Mmap>` lives at least as long as any borrow
-    ///    obtained through `Deref`.
+    /// 3. The `len * size_of::<C>()` bytes starting at `ptr` are a valid
+    ///    bit-pattern for `[C; len]` — i.e. the file was produced by
+    ///    serialising live `C` values via the same in-memory representation
+    ///    we're now claiming.
+    /// 4. The `Arc<Mmap>` lives at least as long as any borrow obtained through
+    ///    `Deref`.
     #[cfg(feature = "mmap")]
     pub(crate) unsafe fn mapped(mmap: Arc<Mmap>, ptr: *const C, len: usize) -> Self {
         BasesStorage::Mapped {

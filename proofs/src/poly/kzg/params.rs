@@ -1,8 +1,5 @@
 use std::{fmt::Debug, io};
 
-use crate::poly::kzg::bases::BasesStorage;
-#[cfg(feature = "mmap")]
-use crate::poly::kzg::bases::{map_block, slice_as_bytes};
 use ff::{Field, PrimeField};
 use group::{Curve, Group, GroupEncoding, prime::PrimeCurveAffine};
 use midnight_curves::{
@@ -11,8 +8,12 @@ use midnight_curves::{
 };
 use rand_core::RngCore;
 
+#[cfg(feature = "mmap")]
+use crate::poly::kzg::bases::{map_block, slice_as_bytes};
 use crate::{
-    poly::{PolynomialBasis, PolynomialRepresentation, commitment::Params},
+    poly::{
+        PolynomialBasis, PolynomialRepresentation, commitment::Params, kzg::bases::BasesStorage,
+    },
     utils::{
         SerdeFormat,
         arithmetic::{CurveAffine, g_to_lagrange, parallelize},
@@ -95,12 +96,13 @@ where
         }
     }
 
-    /// Write the SRS in the layout [`read_mmap_arc`](Self::read_mmap_arc) expects.
+    /// Write the SRS in the layout [`read_mmap_arc`](Self::read_mmap_arc)
+    /// expects.
     ///
-    /// Format **v2**. v1 carried two bases; upstream's `ParamsKZG` now holds four
-    /// — `g`, `g_lagrange`, and the two suffix-sum bases — so the layout gained
-    /// two more blocks and the magic changed to refuse v1 files rather than
-    /// silently misread them.
+    /// Format **v2**. v1 carried two bases; upstream's `ParamsKZG` now holds
+    /// four — `g`, `g_lagrange`, and the two suffix-sum bases — so the
+    /// layout gained two more blocks and the magic changed to refuse v1
+    /// files rather than silently misread them.
     ///
     /// ```text
     /// 0    "MDNGHTV2"  magic

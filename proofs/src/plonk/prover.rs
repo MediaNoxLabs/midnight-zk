@@ -13,13 +13,13 @@ use rayon::iter::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
 };
 
-use super::cosets::build_cosets;
 use super::{
     Error, ProvingKey,
     circuit::{
         Advice, Any, Assignment, Circuit, Column, ConstraintSystem, Fixed, FloorPlanner, Instance,
         Selector,
     },
+    cosets::build_cosets,
     logup, permutation,
     phase_metrics::log_phase,
 };
