@@ -204,29 +204,50 @@ pub fn msm_specific<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C::Curve]) ->
         // Override the chunk size with `MIDNIGHT_MSM_CHUNK_LOG2` (an
         // integer; final chunk size = `1 << that`). Set to a large
         // value (e.g. 32) to disable chunking entirely.
-        const DEFAULT_CHUNK_LOG2: u32 = 18;
-        let chunk_log2: u32 = std::env::var("MIDNIGHT_MSM_CHUNK_LOG2")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(DEFAULT_CHUNK_LOG2);
-        let chunk: usize = 1usize << chunk_log2;
-
-        if coeffs.len() <= chunk {
-            let mut affine_bases = vec![C::identity(); coeffs.len()];
-            C::Curve::batch_normalize(&bases, &mut affine_bases);
-            return msm_best(&coeffs, &affine_bases);
-        }
-
-        let mut acc = C::Curve::identity();
-        for (c_chunk, b_chunk) in coeffs.chunks(chunk).zip(bases.chunks(chunk)) {
-            let mut affine_chunk = vec![C::identity(); c_chunk.len()];
-            C::Curve::batch_normalize(b_chunk, &mut affine_chunk);
-            acc += msm_best(c_chunk, &affine_chunk);
-            // affine_chunk + msm_best's bases_local drop here, freeing
-            // ~48 MiB before the next iteration allocates.
-        }
-        acc
+        msm_chunked::<C>(&coeffs, &bases, msm_chunk_size())
     }
+}
+
+/// Chunk size for the Pippenger fallback, read from the environment.
+///
+/// Split from [`msm_chunked`] deliberately, for the same reason
+/// `plonk::cosets::spill_decision` is split from `should_spill_cosets`:
+/// mutating process environment inside a test is `unsafe` under Rust 2024 and
+/// races with every other test in the binary. Keeping the mechanism reachable
+/// without going through the variable is what makes it testable at all.
+fn msm_chunk_size() -> usize {
+    const DEFAULT_CHUNK_LOG2: u32 = 18;
+    let chunk_log2: u32 = std::env::var("MIDNIGHT_MSM_CHUNK_LOG2")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_CHUNK_LOG2);
+    1usize << chunk_log2
+}
+
+/// Pippenger over fixed-size chunks, summing the partial results.
+///
+/// Chunking is a pure restructuring of the same sum: Pippenger composes over
+/// any partition of the input, so the result must equal the unchunked one for
+/// every `chunk`. That is a property worth asserting rather than assuming —
+/// this sits on the `commit_lagrange` path, and an optimisation that quietly
+/// changed a commitment would still pass every other test in the suite.
+/// [`chunked_msm_agrees_with_unchunked`] is that assertion.
+fn msm_chunked<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C::Curve], chunk: usize) -> C::Curve {
+    if coeffs.len() <= chunk {
+        let mut affine_bases = vec![C::identity(); coeffs.len()];
+        C::Curve::batch_normalize(bases, &mut affine_bases);
+        return msm_best(coeffs, &affine_bases);
+    }
+
+    let mut acc = C::Curve::identity();
+    for (c_chunk, b_chunk) in coeffs.chunks(chunk).zip(bases.chunks(chunk)) {
+        let mut affine_chunk = vec![C::identity(); c_chunk.len()];
+        C::Curve::batch_normalize(b_chunk, &mut affine_chunk);
+        acc += msm_best(c_chunk, &affine_chunk);
+        // affine_chunk + msm_best's bases_local drop here, freeing
+        // ~48 MiB before the next iteration allocates.
+    }
+    acc
 }
 
 /// Two channel MSM accumulator
@@ -336,5 +357,88 @@ where
         let terms = &[term_1, term_2];
 
         bool::from(E::multi_miller_loop(&terms[..]).final_exponentiation().is_identity())
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use ff::Field;
+    use group::Group;
+    use midnight_curves::{Fq, G1Affine, G1Projective};
+    use rand_core::OsRng;
+
+    use super::{msm_chunk_size, msm_chunked};
+
+    /// Chunking must not change the answer.
+    ///
+    /// `msm_chunked` splits the input, runs Pippenger per chunk and sums the
+    /// partials. That is only valid because the sum is associative over any
+    /// partition — so the same inputs must give the same point for every
+    /// chunk size, including sizes that do not divide the length evenly.
+    ///
+    /// Without this the optimisation could change a commitment and every
+    /// other test in the suite would still pass, because nothing else
+    /// compares the two arms. The same gap was found and closed for the
+    /// coset spill (`plonk::cosets::spilled_and_heap_cosets_agree`); this
+    /// is its counterpart on the MSM path.
+    #[test]
+    fn chunked_msm_agrees_with_unchunked() {
+        const N: usize = 64;
+
+        let coeffs: Vec<Fq> = (0..N).map(|_| Fq::random(OsRng)).collect();
+        let bases: Vec<G1Projective> = (0..N).map(|_| G1Projective::random(OsRng)).collect();
+
+        // `chunk >= N` takes the single-shot arm: the reference answer.
+        let reference = msm_chunked::<G1Affine>(&coeffs, &bases, N);
+
+        // Sizes chosen to cover the cases the loop can get wrong: a divisor,
+        // a non-divisor leaving a short final chunk, one larger than the
+        // input, and the degenerate chunk of one.
+        for chunk in [1usize, 3, 7, 8, 16, N - 1, N, N + 1, 4096] {
+            let got = msm_chunked::<G1Affine>(&coeffs, &bases, chunk);
+            assert_eq!(
+                got, reference,
+                "chunked MSM disagreed with the unchunked result at chunk={chunk}"
+            );
+        }
+    }
+
+    /// Zero coefficients must not shift the result.
+    ///
+    /// `msm_specific` filters zero scalars before chunking, so the chunk
+    /// boundaries land on a *different* partition than the caller's indices.
+    /// This checks the arithmetic is indifferent to that.
+    #[test]
+    fn chunked_msm_is_indifferent_to_zero_coefficients() {
+        const N: usize = 32;
+
+        let mut coeffs: Vec<Fq> = (0..N).map(|_| Fq::random(OsRng)).collect();
+        let bases: Vec<G1Projective> = (0..N).map(|_| G1Projective::random(OsRng)).collect();
+        for (i, c) in coeffs.iter_mut().enumerate() {
+            if i % 3 == 0 {
+                *c = Fq::ZERO;
+            }
+        }
+
+        let reference = msm_chunked::<G1Affine>(&coeffs, &bases, N);
+        for chunk in [1usize, 5, 16] {
+            assert_eq!(
+                msm_chunked::<G1Affine>(&coeffs, &bases, chunk),
+                reference,
+                "zero coefficients changed the result at chunk={chunk}"
+            );
+        }
+    }
+
+    /// The default must be the documented 2^18, and the override must parse.
+    ///
+    /// Read only — the value is not set here. A test that mutated the
+    /// environment would be `unsafe` under Rust 2024 and would race every
+    /// other test in this binary.
+    #[test]
+    fn chunk_size_default_is_two_to_the_eighteen() {
+        if std::env::var("MIDNIGHT_MSM_CHUNK_LOG2").is_err() {
+            assert_eq!(msm_chunk_size(), 1 << 18);
+        }
     }
 }
