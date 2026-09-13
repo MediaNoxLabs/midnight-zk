@@ -29,7 +29,7 @@ use crate::{
 
 mod circuit;
 /// Coset construction, spilling to disk when built to.
-pub mod cosets;
+pub(crate) mod cosets;
 mod error;
 pub(crate) mod evaluation;
 mod keygen;
@@ -421,7 +421,7 @@ impl<F: PrimeField, CS: PolynomialCommitmentScheme<F>> ProvingKey<F, CS> {
     /// See [`Self::spill_all_to_mmap`] for a one-shot variant that
     /// also handles `fixed_values` and `permutation.polys` (P3).
     #[cfg(feature = "disk-spill")]
-    pub fn spill_fixed_polys_to_mmap(&mut self) -> std::io::Result<()> {
+    pub(crate) fn spill_fixed_polys_to_mmap(&mut self) -> std::io::Result<()> {
         if self.fixed_polys_mmap.is_some() {
             return Ok(());
         }
@@ -439,7 +439,7 @@ impl<F: PrimeField, CS: PolynomialCommitmentScheme<F>> ProvingKey<F, CS> {
     /// mmap-backed storage. Mirrors `spill_fixed_polys_to_mmap`.
     /// Target: ~640 MiB phys_footprint relief at k=21.
     #[cfg(feature = "disk-spill")]
-    pub fn spill_fixed_values_to_mmap(&mut self) -> std::io::Result<()> {
+    pub(crate) fn spill_fixed_values_to_mmap(&mut self) -> std::io::Result<()> {
         if self.fixed_values_mmap.is_some() {
             return Ok(());
         }
@@ -458,7 +458,7 @@ impl<F: PrimeField, CS: PolynomialCommitmentScheme<F>> ProvingKey<F, CS> {
     /// `permutation::ProvingKey` stays clone-safe and small.
     /// Target: ~640 MiB phys_footprint relief at k=21.
     #[cfg(feature = "disk-spill")]
-    pub fn spill_permutation_polys_to_mmap(&mut self) -> std::io::Result<()> {
+    pub(crate) fn spill_permutation_polys_to_mmap(&mut self) -> std::io::Result<()> {
         if self.permutation_polys_mmap.is_some() {
             return Ok(());
         }
@@ -482,7 +482,7 @@ impl<F: PrimeField, CS: PolynomialCommitmentScheme<F>> ProvingKey<F, CS> {
     /// pulls iOS below the iPhone 16 Pro jetsam threshold and
     /// makes real-device k=21 viable.
     #[cfg(feature = "disk-spill")]
-    pub fn spill_all_to_mmap(&mut self) -> std::io::Result<()> {
+    pub(crate) fn spill_all_to_mmap(&mut self) -> std::io::Result<()> {
         self.spill_fixed_polys_to_mmap()?;
         self.spill_fixed_values_to_mmap()?;
         self.spill_permutation_polys_to_mmap()?;
