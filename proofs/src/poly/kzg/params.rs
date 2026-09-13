@@ -6,8 +6,7 @@ use midnight_curves::pairing::{Engine, MultiMillerLoop};
 use rand_core::RngCore;
 
 use crate::{
-    poly::commitment::Params,
-    poly::kzg::bases::BasesStorage,
+    poly::{commitment::Params, kzg::bases::BasesStorage},
     utils::{
         arithmetic::{g_to_lagrange, parallelize},
         helpers::ProcessedSerdeObject,
@@ -21,10 +20,10 @@ use crate::{
 /// independent SRS material — anything we know about `g` determines
 /// `g_lagrange` exactly. To keep the resident SRS as small as possible on
 /// memory-constrained targets (mobile, wasm), `g_lagrange` is wrapped in
-/// `OnceLock`: callers can release it via [`drop_lazy_bases`](Self::drop_lazy_bases)
-/// between proofs and the next `commit_lagrange` (or other Lagrange-basis
-/// access via [`g_lagrange_slice`](Self::g_lagrange_slice)) will rebuild it
-/// from `g`.
+/// `OnceLock`: callers can release it via
+/// [`drop_lazy_bases`](Self::drop_lazy_bases) between proofs and the next
+/// `commit_lagrange` (or other Lagrange-basis access via
+/// [`g_lagrange_slice`](Self::g_lagrange_slice)) will rebuild it from `g`.
 ///
 /// File-format compatibility is preserved: `read_custom` still consumes
 /// the `g_lagrange` bytes the writer produced and pre-populates the lock,
@@ -35,7 +34,10 @@ use crate::{
 pub struct ParamsKZG<E: Engine> {
     /// SRS monomial basis. Heap-allocated `Vec` in the eager path
     /// (`unsafe_setup`, `read_custom`); slice view into a memory-
-    /// mapped file when constructed via [`read_mmap_arc`](Self::read_mmap_arc).
+    /// mapped file when constructed via `read_mmap_arc`.
+    ///
+    /// Not linked, because that method exists only under the `mmap` feature
+    /// and a default-feature doc build would fail to resolve it.
     pub(crate) g: BasesStorage<E::G1>,
     /// SRS Lagrange basis. Lazy — see crate-level docs.
     /// `g_to_lagrange` only produces owned Vecs, so any
@@ -318,16 +320,16 @@ where
     /// `g_lagrange_slice` consumer) will recompute it via inverse-NTT
     /// of `g`.
     ///
-    /// Memory profile vs. [`read_custom`]:
+    /// Memory profile vs. `read_custom`:
     ///
-    /// - `read_custom` allocates two `Vec<E::G1>` of size 2^k during
-    ///   parsing. Peak resident is 2× the SRS during load.
-    /// - `read_custom_lazy` allocates only the `g` vector. Peak resident
-    ///   stays at 1× the SRS during load.
-    /// - The `Vec::drop` + recompute approach has the same final
-    ///   footprint as `read_custom_lazy` *but* a 2× peak during load,
-    ///   plus the allocator pool tends to keep the freed pages. Doing
-    ///   the skip at read time avoids both costs.
+    /// - `read_custom` allocates two `Vec<E::G1>` of size 2^k during parsing.
+    ///   Peak resident is 2× the SRS during load.
+    /// - `read_custom_lazy` allocates only the `g` vector. Peak resident stays
+    ///   at 1× the SRS during load.
+    /// - The `Vec::drop` + recompute approach has the same final footprint as
+    ///   `read_custom_lazy` *but* a 2× peak during load, plus the allocator
+    ///   pool tends to keep the freed pages. Doing the skip at read time avoids
+    ///   both costs.
     ///
     /// At k=20 (BLS12-381, 96 B per stored G1 element) this saves
     /// ~96 MiB peak; at k=22 it saves ~384 MiB. Critical on mobile
@@ -559,8 +561,9 @@ where
     }
 
     /// Writes the in-memory `ParamsKZG` to a companion file laid out
-    /// for [`read_mmap_arc`]. Includes both `g` and `g_lagrange`
-    /// (the latter is force-materialised via `g_lagrange_slice`).
+    /// for [`read_mmap_arc`](Self::read_mmap_arc). Includes both `g` and
+    /// `g_lagrange` (the latter is force-materialised via
+    /// `g_lagrange_slice`).
     ///
     /// Disk cost at BLS12-381 / k=20 / projective storage:
     /// 64 B header + 2 × 2^20 × 144 B + g2 + s_g2 ≈ 288 MiB. Bigger
@@ -827,19 +830,18 @@ mod test {
 
     /// Round-trip a `ParamsKZG` through the companion mmap format.
     /// Verifies that:
-    ///  1. `write_mmap_companion` produces a file that
-    ///     `read_mmap_arc` accepts;
-    ///  2. The reconstructed `g`, `g_lagrange`, `g2`, `s_g2` all
-    ///     equal the originals byte-for-byte;
-    ///  3. The reconstructed `g` is genuinely backed by the mmap
-    ///     (not silently copied into an owned `Vec`).
+    ///  1. `write_mmap_companion` produces a file that `read_mmap_arc` accepts;
+    ///  2. The reconstructed `g`, `g_lagrange`, `g2`, `s_g2` all equal the
+    ///     originals byte-for-byte;
+    ///  3. The reconstructed `g` is genuinely backed by the mmap (not silently
+    ///     copied into an owned `Vec`).
     #[cfg(feature = "mmap")]
     #[test]
     fn test_mmap_companion_round_trip() {
         const K: u32 = 5;
+        use std::{io::Write as _, sync::Arc};
+
         use midnight_curves::Bls12;
-        use std::io::Write as _;
-        use std::sync::Arc;
 
         let params0: ParamsKZG<Bls12> = ParamsKZG::unsafe_setup(K, OsRng);
 
