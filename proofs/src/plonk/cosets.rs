@@ -14,7 +14,7 @@ use crate::poly::{Coeff, ExtendedLagrangeCoeff, Polynomial};
 /// Both arms hand out `&[Polynomial<F, ExtendedLagrangeCoeff>]`, which is what
 /// `evaluate_numerator` already takes — so the choice is invisible to the
 /// evaluator and no call site changes shape.
-pub enum Cosets<F> {
+pub(crate) enum Cosets<F> {
     /// The default: built in parallel and held in memory.
     Heap(Vec<Polynomial<F, ExtendedLagrangeCoeff>>),
     /// Streamed to a tempfile and mapped back, one polynomial at a time.
@@ -37,7 +37,7 @@ impl<F> std::fmt::Debug for Cosets<F> {
 
 impl<F> Cosets<F> {
     /// Borrow as a flat slice, whichever arm this is.
-    pub fn as_slice(&self) -> &[Polynomial<F, ExtendedLagrangeCoeff>] {
+    pub(crate) fn as_slice(&self) -> &[Polynomial<F, ExtendedLagrangeCoeff>] {
         match self {
             Cosets::Heap(v) => v,
             #[cfg(feature = "disk-spill")]
@@ -53,7 +53,7 @@ impl<F> Cosets<F> {
 /// a loss at small `k` — the file write and page faults cost more than the heap
 /// the small cosets would have occupied. It earns its keep only once the cosets
 /// approach the memory ceiling.
-pub fn should_spill_cosets(k: u32) -> bool {
+pub(crate) fn should_spill_cosets(k: u32) -> bool {
     const DEFAULT_SPILL_FLOOR_K: u32 = 18;
     let floor = std::env::var("MIDNIGHT_SPILL_FLOOR_K")
         .ok()
@@ -75,7 +75,7 @@ pub fn should_spill_cosets(k: u32) -> bool {
 /// report a spill that never happened. Callers wanting to narrate the choice
 /// should ask this instead — and it keeps the `cfg` here rather than at every
 /// call site.
-pub fn will_spill(k: u32) -> bool {
+pub(crate) fn will_spill(k: u32) -> bool {
     #[cfg(feature = "disk-spill")]
     {
         should_spill_cosets(k)
@@ -102,7 +102,11 @@ fn spill_decision(k: u32, enabled: bool, floor: u32) -> bool {
 /// A spill failure is **not** fatal: it falls back to the heap path and the
 /// proof is still produced. Running out of tempfile space should degrade to the
 /// behaviour we had before this optimisation existed, not abort a proof.
-pub fn build_cosets<F, D>(polys: &[Polynomial<F, Coeff>], k: u32, to_extended: D) -> Cosets<F>
+pub(crate) fn build_cosets<F, D>(
+    polys: &[Polynomial<F, Coeff>],
+    k: u32,
+    to_extended: D,
+) -> Cosets<F>
 where
     F: Send + Sync,
     D: Fn(&Polynomial<F, Coeff>) -> Polynomial<F, ExtendedLagrangeCoeff> + Send + Sync,
