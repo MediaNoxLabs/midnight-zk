@@ -114,8 +114,9 @@ because spilling has to map back what it wrote.
 - **Both arms agree.** An optimisation that changes a proof is worse than no
   optimisation. `plonk::cosets::spilled_and_heap_cosets_agree` and
   `poly::kzg::msm::chunked_msm_agrees_with_unchunked` exist for this, and test
-  counts rise with features — 43 / 44 / 51 — so a gated-off arm cannot go
-  quietly untested.
+  counts rise with features — 43 / 54 / 65 — so a gated-off arm cannot go
+  quietly untested. `dev::cost_model`'s real-key test proves with a *spilled*
+  key and verifies with the verifier that accepts the heap key's proof.
 - **The `unsafe` is confined and opted out of per site**, not per module, so a
   newly added `unsafe` block is a build error rather than a silent addition.
 - **Failure is not silent.** A spill that cannot be created falls back to the
@@ -124,9 +125,16 @@ because spilling has to map back what it wrote.
   (`posix_fallocate`, `F_PREALLOCATE`) so ENOSPC surfaces as an `io::Error`
   rather than a SIGBUS during a page fault.
 - **The companion file is a local cache, not an interchange format.** Its
-  header is validated — magic, point size, offsets, counts, alignment — but its
-  contents are not, so a file an attacker can write yields wrong proofs. The
-  trust boundary is stated on both entry points.
+  header is validated — magic, version, a layout identity over (curve type,
+  point size, alignment, `k`), offsets, counts, alignment — with every length
+  and offset through checked arithmetic, so a damaged file is `InvalidData`,
+  never a panic and never an out-of-range slice. Its *contents* are not
+  validated: the identity tells a file built for a different curve, layout or
+  `k` from this one, not a same-`k` SRS from a different setup, so a file an
+  attacker can write yields wrong proofs. Both entry points are bounded on the
+  sealed `PlainBytes` trait, so the byte reinterpretation is only reachable for
+  curves whose layout this crate has checked. The trust boundary is stated on
+  both entry points.
 
 ## What is deliberately not here
 
