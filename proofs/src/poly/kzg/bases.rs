@@ -40,7 +40,15 @@
 //! the whole optimisation rests on. All `unsafe` blocks are
 //! confined here behind invariants documented at construction.
 
-#![allow(unsafe_code)]
+// The crate denies `unsafe_code`; this module opts out **per site** rather
+// than with a module-level `#![allow]`.
+//
+// The difference matters. A module-level opt-out makes every future `unsafe`
+// in this file compile silently, which is precisely the warning
+// `deny(unsafe_code)` exists to raise. Per-site, adding one is a deliberate
+// act that shows up in a diff as its own line.
+//
+// Four sites, each with its own SAFETY note below.
 
 use std::ops::Deref;
 #[cfg(feature = "mmap")]
@@ -74,7 +82,9 @@ pub(crate) enum BasesStorage<C: 'static> {
 // threads as long as `C: Send + Sync`. The mapping itself is
 // Send + Sync (memmap2 doc); the pointer is immutable for the
 // lifetime of the value.
+#[allow(unsafe_code)]
 unsafe impl<C: Send + Sync + 'static> Send for BasesStorage<C> {}
+#[allow(unsafe_code)]
 unsafe impl<C: Send + Sync + 'static> Sync for BasesStorage<C> {}
 
 impl<C: 'static> BasesStorage<C> {
@@ -98,6 +108,7 @@ impl<C: 'static> BasesStorage<C> {
     /// 4. The `Arc<Mmap>` lives at least as long as any borrow obtained through
     ///    `Deref`.
     #[cfg(feature = "mmap")]
+    #[allow(unsafe_code)]
     pub(crate) unsafe fn mapped(mmap: Arc<Mmap>, ptr: *const C, len: usize) -> Self {
         BasesStorage::Mapped {
             _mmap: mmap,
@@ -148,6 +159,7 @@ impl<C: 'static> Deref for BasesStorage<C> {
             // SAFETY: documented invariants in `mapped()` plus
             // `_mmap` keeps the region alive for our lifetime.
             #[cfg(feature = "mmap")]
+            #[allow(unsafe_code)]
             BasesStorage::Mapped { ptr, len, .. } => unsafe {
                 std::slice::from_raw_parts(*ptr, *len)
             },
