@@ -78,8 +78,10 @@ use memmap2::Mmap;
 /// This is the same contract `bytemuck::Pod` expresses. It is spelled out here
 /// rather than taking the dependency, and because the sealing is the point: a
 /// downstream `Engine` must not be able to opt its own curve in.
+#[cfg(feature = "mmap")]
 pub trait PlainBytes: sealed::Sealed + Copy + 'static {}
 
+#[cfg(feature = "mmap")]
 mod sealed {
     /// Prevents implementation outside this crate.
     pub trait Sealed {}
@@ -87,7 +89,9 @@ mod sealed {
 
 // BLS12-381 G1 in projective form: three field elements, each a `[u64; 6]`
 // wrapper with no padding and no niche, so every bit pattern is inhabited.
+#[cfg(feature = "mmap")]
 impl sealed::Sealed for midnight_curves::G1Projective {}
+#[cfg(feature = "mmap")]
 impl PlainBytes for midnight_curves::G1Projective {}
 
 /// Storage backing for an SRS basis vector.
