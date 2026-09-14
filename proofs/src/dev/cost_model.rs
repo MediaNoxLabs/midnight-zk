@@ -794,6 +794,126 @@ mod tests {
         assert_eq!(circuit_model::<_, 48, 32>(&circuit).size, proof.len());
     }
 
+    /// A spilled prover key must prove, and the proof must verify — MZK-006's
+    /// real-key regression.
+    ///
+    /// `StandardPlonk` is the right fixture because it has fixed columns and
+    /// equality constraints, so both `fixed_polys` and `permutation.polys`
+    /// actually exist to be spilled; the trivial circuits elsewhere have
+    /// nothing to map and would pass vacuously.
+    ///
+    /// Drives `read_with_policy` directly rather than setting a variable: the
+    /// process policy is `OnceLock`-frozen on first use, and mutating the
+    /// environment from a test is `unsafe` under Rust 2024 and races the rest
+    /// of the binary. This is also the reason MZK-007 exists.
+    #[cfg(feature = "disk-spill")]
+    #[test]
+    fn spilled_key_proves_and_the_proof_verifies() {
+        use crate::{
+            config::ProverConfig,
+            plonk::{parse_trace, verify_algebraic_constraints, ProvingKey},
+            poly::commitment::Guard,
+            utils::SerdeFormat,
+        };
+
+        let k = 9;
+        let circuit = StandardPlonk::<1>(Fq::from(7u64));
+        let params = ParamsKZG::<Bls12>::unsafe_setup(k, OsRng);
+        let vk =
+            keygen_vk_with_k::<_, KZGCommitmentScheme<Bls12>, _>(&params, &circuit, k).expect("vk");
+        let fresh = keygen_pk(vk, &circuit).expect("pk");
+        let bytes = fresh.to_bytes(SerdeFormat::RawBytesUnchecked);
+        drop(fresh);
+
+        let load = |policy: &ProverConfig| {
+            ProvingKey::<Fq, KZGCommitmentScheme<Bls12>>::read_with_policy::<_, StandardPlonk<1>>(
+                &mut &bytes[..],
+                SerdeFormat::RawBytesUnchecked,
+                #[cfg(feature = "circuit-params")]
+                (),
+                policy,
+            )
+            .expect("read_with_policy")
+        };
+
+        // The spilled key: both derived coset caches deferred, both sidecars
+        // present — this fixture genuinely has something to map.
+        let spilled = load(&ProverConfig::mapped_key());
+        assert!(
+            spilled.fixed_cosets.is_empty(),
+            "fixed cosets must be deferred"
+        );
+        assert!(
+            spilled.permutation.cosets.is_empty(),
+            "permutation cosets must be deferred"
+        );
+        assert!(
+            spilled.fixed_polys_mmap.is_some(),
+            "fixed polys must be mapped"
+        );
+        assert!(
+            spilled.permutation_polys_mmap.is_some(),
+            "permutation polys must be mapped"
+        );
+        assert!(spilled.fixed_polys.is_empty() && spilled.permutation.polys.is_empty());
+
+        // And a heap key for the two comparisons below.
+        let heap = load(&ProverConfig::heap());
+        assert_eq!(
+            spilled.to_bytes(SerdeFormat::RawBytesUnchecked),
+            heap.to_bytes(SerdeFormat::RawBytesUnchecked),
+            "where the values live must not change what the key serialises to"
+        );
+
+        let instances: &[&[Fq]] = &[&[circuit.0]];
+        let prove = |pk: &ProvingKey<Fq, KZGCommitmentScheme<Bls12>>| {
+            let mut transcript = CircuitTranscript::<State>::init();
+            create_proof::<Fq, KZGCommitmentScheme<Bls12>, _, _>(
+                &params,
+                pk,
+                std::slice::from_ref(&circuit),
+                #[cfg(feature = "committed-instances")]
+                0,
+                &[instances],
+                &mut transcript,
+                OsRng,
+            )
+            .expect("proof generation");
+            transcript.finalize()
+        };
+        let verify = |vk: &crate::plonk::VerifyingKey<Fq, KZGCommitmentScheme<Bls12>>,
+                      proof: &[u8]| {
+            let mut transcript = CircuitTranscript::<State>::init_from_bytes(proof);
+            // Zero committed instances were used above, so each proof's committed
+            // slice is empty.
+            let trace = parse_trace(
+                vk,
+                #[cfg(feature = "committed-instances")]
+                &[&[]],
+                &[instances],
+                &mut transcript,
+            )
+            .expect("parse_trace");
+            let guard = verify_algebraic_constraints(
+                vk,
+                trace,
+                #[cfg(feature = "committed-instances")]
+                &[&[]],
+                &[instances],
+                &mut transcript,
+            )
+            .expect("algebraic constraints");
+            guard.verify(&params.verifier_params()).expect("opening verification");
+        };
+
+        // The property under test: a proof made from the *spilled* key — fixed
+        // and permutation polynomials read through mapped views, cosets rebuilt
+        // lazily on the spill path — is accepted by the same verifier that
+        // accepts the heap key's proof.
+        verify(spilled.get_vk(), &prove(&spilled));
+        verify(heap.get_vk(), &prove(&heap));
+    }
+
     #[test]
     fn check_correct_computation_k() {
         let mut random_byte = [0u8; 1];
