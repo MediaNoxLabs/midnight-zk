@@ -1,6 +1,12 @@
 //! Prover memory policy: how much RAM the prover is allowed to use, and what
 //! it may spend instead.
 //!
+//! `docs/memory-profile.md` is the rationale — the problem, the measurements
+//! including the unflattering ones, the alternatives rejected, and what a
+//! reviewer should check. Read that before deciding which policy to set; these
+//! settings cost time, and on a host with RAM to spare they are a straight
+//! loss.
+//!
 //! # Why this is a type and not five `env::var` calls
 //!
 //! The optimisations in this crate trade memory for CPU and disk. Which trade
