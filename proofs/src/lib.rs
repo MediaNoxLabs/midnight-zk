@@ -24,6 +24,7 @@ compile_error!(
      provide. Build without it: cosets are held on the heap instead."
 );
 pub mod circuit;
+pub mod config;
 pub mod plonk;
 pub mod poly;
 pub mod transcript;

@@ -584,10 +584,7 @@ where
         // silently returning the partially converted key would be invalid. The
         // caller can retry the read explicitly with spilling disabled.
         #[cfg(feature = "disk-spill")]
-        if matches!(
-            std::env::var("MIDNIGHT_SPILL_PK").as_deref(),
-            Ok("1") | Ok("true")
-        ) {
+        if crate::config::ProverConfig::process().map_prover_key {
             pk.spill_all_to_mmap()?;
         }
         Ok(pk)

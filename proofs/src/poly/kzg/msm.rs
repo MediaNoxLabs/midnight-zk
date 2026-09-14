@@ -216,12 +216,7 @@ pub fn msm_specific<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C::Curve]) ->
 /// races with every other test in the binary. Keeping the mechanism reachable
 /// without going through the variable is what makes it testable at all.
 fn msm_chunk_size() -> usize {
-    const DEFAULT_CHUNK_LOG2: u32 = 18;
-    let chunk_log2: u32 = std::env::var("MIDNIGHT_MSM_CHUNK_LOG2")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_CHUNK_LOG2);
-    1usize << chunk_log2
+    crate::config::ProverConfig::process().msm_chunk()
 }
 
 /// Pippenger over fixed-size chunks, summing the partial results.
@@ -432,15 +427,17 @@ mod test {
         }
     }
 
-    /// The default must be the documented 2^18, and the override must parse.
-    ///
-    /// Read only — the value is not set here. A test that mutated the
-    /// environment would be `unsafe` under Rust 2024 and would race every
-    /// other test in this binary.
+    /// The chunk size comes from the policy, so it can be asserted directly
+    /// rather than guarded on whether someone's shell happens to set a
+    /// variable. `config::test::msm_chunk_is_two_to_the_log` covers the
+    /// default and the arithmetic.
     #[test]
-    fn chunk_size_default_is_two_to_the_eighteen() {
-        if std::env::var("MIDNIGHT_MSM_CHUNK_LOG2").is_err() {
-            assert_eq!(msm_chunk_size(), 1 << 18);
-        }
+    fn chunk_size_comes_from_the_policy() {
+        use crate::config::{ProverConfig, DEFAULT_MSM_CHUNK_LOG2};
+        assert_eq!(
+            ProverConfig::heap().msm_chunk(),
+            1 << DEFAULT_MSM_CHUNK_LOG2
+        );
+        assert_eq!(msm_chunk_size(), ProverConfig::process().msm_chunk());
     }
 }

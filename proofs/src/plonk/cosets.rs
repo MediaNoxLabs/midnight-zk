@@ -45,24 +45,15 @@ impl<F> Cosets<F> {
     }
 }
 
-/// Whether to spill cosets for a circuit of size `k`.
+/// Whether the process policy spills cosets for a circuit of size `k`.
 ///
-/// Off unless `MIDNIGHT_SPILL_COSETS` is `1`/`true`, and then only at or above
-/// `MIDNIGHT_SPILL_FLOOR_K` (default 18). The floor exists because spilling is
-/// a loss at small `k` — the file write and page faults cost more than the heap
-/// the small cosets would have occupied. It earns its keep only once the cosets
-/// approach the memory ceiling.
+/// The decision itself lives on [`ProverConfig`](crate::config::ProverConfig)
+/// and is pure; this only supplies the process-wide policy. The floor exists
+/// because spilling is a loss at small `k` — the file write and page faults
+/// cost more than the heap the small cosets would have occupied — so it earns
+/// its keep only once the cosets approach the memory ceiling.
 pub(crate) fn should_spill_cosets(k: u32) -> bool {
-    const DEFAULT_SPILL_FLOOR_K: u32 = 18;
-    let floor = std::env::var("MIDNIGHT_SPILL_FLOOR_K")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_SPILL_FLOOR_K);
-    let enabled = matches!(
-        std::env::var("MIDNIGHT_SPILL_COSETS").as_deref(),
-        Ok("1") | Ok("true")
-    );
-    spill_decision(k, enabled, floor)
+    crate::config::ProverConfig::process().spills_cosets_at(k)
 }
 
 /// Whether [`build_cosets`] will *actually* spill: the environment gate **and**
@@ -84,15 +75,6 @@ pub(crate) fn will_spill(k: u32) -> bool {
         let _ = k;
         false
     }
-}
-
-/// The decision itself, separated from reading the environment.
-///
-/// Split out so it can be tested directly: mutating process environment from a
-/// test is `unsafe` under Rust 2024 and races with every other test in the
-/// binary, so the gate would otherwise be either untested or flaky.
-fn spill_decision(k: u32, enabled: bool, floor: u32) -> bool {
-    enabled && k >= floor
 }
 
 /// Build extended-domain cosets from `polys`, spilling to disk when
@@ -184,20 +166,8 @@ mod test {
         }
     }
 
-    #[test]
-    fn spill_gate_needs_both_the_switch_and_the_floor() {
-        // Guards the gate itself: the difference between an optimisation that
-        // engages where it helps and one that fires at every k.
-        assert!(
-            !spill_decision(17, true, 18),
-            "below the floor must not spill"
-        );
-        assert!(spill_decision(18, true, 18), "at the floor must spill");
-        assert!(spill_decision(20, true, 18), "above the floor must spill");
-        assert!(
-            !spill_decision(20, false, 18),
-            "switch off must not spill at any k"
-        );
-        assert!(!spill_decision(0, false, 0), "both off is off");
-    }
+    // The gate itself is now `ProverConfig::spills_cosets_at`, and
+    // `config::test::the_spill_gate_needs_both_the_switch_and_the_floor`
+    // asserts the same property against the type that owns it. Keeping a
+    // second copy here would be two tests of one rule, drifting apart.
 }

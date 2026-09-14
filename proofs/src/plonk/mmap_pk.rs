@@ -105,9 +105,9 @@ impl<F, B> MmappedPolys<F, B> {
 /// emulator `/data/local/tmp`). Falls back to the OS default when
 /// the env var is unset or empty.
 fn make_tempfile() -> io::Result<std::fs::File> {
-    match std::env::var("MIDNIGHT_SPILL_DIR") {
-        Ok(dir) if !dir.is_empty() => tempfile::tempfile_in(dir),
-        _ => tempfile::tempfile(),
+    match crate::config::ProverConfig::process().spill_dir.as_ref() {
+        Some(dir) => tempfile::tempfile_in(dir),
+        None => tempfile::tempfile(),
     }
 }
 
