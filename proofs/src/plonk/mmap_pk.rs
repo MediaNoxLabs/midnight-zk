@@ -96,20 +96,6 @@ impl<F, B> MmappedPolys<F, B> {
     pub(crate) fn views(&self) -> Vec<PolynomialView<'_, F, B>> {
         polynomial_views(&self.polys)
     }
-
-    /// Number of polynomials held.
-    // Kept for batch consumers that need to validate descriptor counts.
-    #[allow(dead_code)]
-    pub(crate) fn len(&self) -> usize {
-        self.polys.len()
-    }
-
-    /// Whether the holder is empty.
-    // Kept for batch consumers that need to validate descriptor counts.
-    #[allow(dead_code)]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.polys.is_empty()
-    }
 }
 
 /// Resolve the tempfile directory used by spills.
@@ -335,7 +321,6 @@ where
 /// n_per_poly)` but the `Vec` is `drain(..)`'d in place so the Vec spine itself
 /// can be freed mid-loop on long batches.
 // Proving-key integration consumes this helper.
-#[allow(dead_code)]
 pub(crate) fn spill_vec_to_disk<F, B>(
     mut polys: Vec<Polynomial<F, B>>,
     n_per_poly: usize,

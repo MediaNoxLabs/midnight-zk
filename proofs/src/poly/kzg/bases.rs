@@ -119,7 +119,10 @@ impl<C: 'static> BasesStorage<C> {
 
     /// `true` when the storage is backed by a memory-mapped file.
     /// Used by `downsize` to refuse in-place mutation.
-    #[allow(dead_code)] // used once downsize is implemented for mapped
+    // Not dead: exercised by this module's tests. Clippy's dead-code pass on
+    // the lib target alone does not see test usage, which is why the previous
+    // `allow` looked justified and was not.
+    #[cfg(test)]
     pub(crate) fn is_mapped(&self) -> bool {
         #[cfg(feature = "mmap")]
         {
