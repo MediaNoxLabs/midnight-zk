@@ -140,6 +140,49 @@ jobs:
           package: midnight-proofs
           args: --release
 
+  # fork-only: the optimisations live behind `mmap` and `disk-spill`, and
+  # `test-proofs` above runs default features only — so until this job existed,
+  # the 46 tests that exist only under `disk-spill` had never run in CI once.
+  # Clippy's `--all-features` compiles those paths but executes nothing.
+  #
+  # The matrix is the same one the local gate uses, for the same reason: a
+  # feature that turns an optimisation on must be tested with it on, and the
+  # spill arm must be forced, because its own floor (`MIDNIGHT_SPILL_FLOOR_K`,
+  # default 18) means a normal test run never reaches it.
+  test-proofs-features:
+    if: github.event.pull_request.draft == false
+    name: Test proofs (${{ matrix.label }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: mmap
+            features: mmap
+            forced: 'false'
+          - label: disk-spill
+            features: disk-spill
+            forced: 'false'
+          - label: disk-spill forced at every k
+            features: disk-spill
+            forced: 'true'
+    steps:
+      - name: Install libfontconfig1-dev
+        run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - name: 'Install rust-toolchain.toml'
+        run: rustup toolchain install
+      - name: Test
+        env:
+          FEATURES: ${{ matrix.features }}
+          FORCED: ${{ matrix.forced }}
+        run: |
+          if [ "$FORCED" = "true" ]; then
+            export MIDNIGHT_SPILL_COSETS=1
+            export MIDNIGHT_SPILL_FLOOR_K=0
+          fi
+          cargo test -p midnight-proofs --release --features "$FEATURES"
+
   test-aggregator:
     if: github.event.pull_request.draft == false
     name: Test Aggregation
