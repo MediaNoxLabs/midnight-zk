@@ -285,7 +285,7 @@ where
 /// of kernel text), so we can call this freely at phase boundaries
 /// without measurable wall-clock overhead.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn sample_rss_hwm_kb() -> Option<(u64, u64)> {
+pub(crate) fn sample_rss_hwm_kb() -> Option<(u64, u64)> {
     let s = std::fs::read_to_string("/proc/self/status").ok()?;
     let mut rss: Option<u64> = None;
     let mut hwm: Option<u64> = None;
@@ -305,7 +305,7 @@ fn sample_rss_hwm_kb() -> Option<(u64, u64)> {
 /// We can't read crate-level deps cleanly here, so call libc
 /// directly via the link-shim that ships with the Rust runtime.
 #[cfg(any(target_os = "macos", target_os = "ios"))]
-fn sample_rss_hwm_kb() -> Option<(u64, u64)> {
+pub(crate) fn sample_rss_hwm_kb() -> Option<(u64, u64)> {
     // SAFETY: `getrusage` is async-signal-safe and pure-read; the
     // `rusage` struct is zero-init then filled by the kernel.
     #[allow(unsafe_code)]
@@ -356,7 +356,7 @@ fn sample_rss_hwm_kb() -> Option<(u64, u64)> {
     target_os = "macos",
     target_os = "ios"
 )))]
-fn sample_rss_hwm_kb() -> Option<(u64, u64)> {
+pub(crate) fn sample_rss_hwm_kb() -> Option<(u64, u64)> {
     None
 }
 

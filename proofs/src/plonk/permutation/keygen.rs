@@ -269,6 +269,31 @@ pub(crate) fn build_vk<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitmentSch
     VerifyingKey { commitments }
 }
 
+/// The coefficient-form polynomials alone, without their extended-domain
+/// cosets.
+///
+/// Used when the caller intends to spill: building the cosets here would put
+/// `4n` per column on the heap at load time, before any policy could move them,
+/// which is the peak the spill exists to avoid. The prover rebuilds them lazily
+/// through `build_cosets` — the path that can spill them — when the cached
+/// collection is empty.
+pub(crate) fn compute_polys<F: WithSmallOrderMulGroup<3>>(
+    domain: &EvaluationDomain<F>,
+    p: &Argument,
+    permutations: &[Polynomial<F, LagrangeCoeff>],
+) -> Vec<Polynomial<F, Coeff>> {
+    let mut polys = vec![domain.empty_coeff(); p.columns.len()];
+    parallelize(&mut polys, |o, start| {
+        for (x, poly) in o.iter_mut().enumerate() {
+            let i = start + x;
+            *poly = domain.lagrange_to_coeff(permutations[i].clone());
+        }
+    });
+    polys
+}
+
+// Inserting `compute_polys` above this function earlier moved this attribute
+// onto the wrong item — the same detachment class as the drifting doc comments.
 #[allow(clippy::type_complexity)]
 pub(crate) fn compute_polys_and_cosets<F: WithSmallOrderMulGroup<3>>(
     domain: &EvaluationDomain<F>,
