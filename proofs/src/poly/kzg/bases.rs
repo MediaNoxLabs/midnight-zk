@@ -78,8 +78,25 @@ use memmap2::Mmap;
 /// This is the same contract `bytemuck::Pod` expresses. It is spelled out here
 /// rather than taking the dependency, and because the sealing is the point: a
 /// downstream `Engine` must not be able to opt its own curve in.
+///
+/// # Safety
+///
+/// Implementing this trait asserts, for `Self`:
+///
+/// 1. **every bit pattern is a valid value** — no niche, no enum discriminant,
+///    no `NonZero`, no validity invariant beyond the bytes themselves; and
+/// 2. **there is no padding** — `size_of::<Self>()` bytes are all initialised
+///    whenever a value exists.
+///
+/// Violating (1) makes reading a file the type did not produce undefined
+/// behaviour; violating (2) makes writing a value out undefined behaviour and
+/// can leak adjacent memory. Every `impl` must carry the justification a
+/// reviewer can check against the type's definition.
 #[cfg(feature = "mmap")]
-pub trait PlainBytes: sealed::Sealed + Copy + 'static {}
+// The crate denies `unsafe_code`; an `unsafe trait` is the deliberate exception
+// here because the trait *is* the safety claim — see its docs.
+#[allow(unsafe_code)]
+pub unsafe trait PlainBytes: sealed::Sealed + Copy + 'static {}
 
 #[cfg(feature = "mmap")]
 mod sealed {
@@ -91,8 +108,15 @@ mod sealed {
 // wrapper with no padding and no niche, so every bit pattern is inhabited.
 #[cfg(feature = "mmap")]
 impl sealed::Sealed for midnight_curves::G1Projective {}
+// SAFETY: `G1Projective` is `blst_p1` behind a `#[repr(transparent)]` wrapper —
+// three `blst_fp`, each `[u64; 6]`. No padding: 3 × 6 × 8 = 144 bytes and
+// `size_of` agrees. No niche: every `[u64; 6]` bit pattern is a valid `blst_fp`
+// *value* (canonicality is a mathematical property checked by the curve code,
+// not a validity invariant of the type). Copy, 'static. Those are exactly the
+// two obligations the trait states; nothing else about the curve is assumed.
 #[cfg(feature = "mmap")]
-impl PlainBytes for midnight_curves::G1Projective {}
+#[allow(unsafe_code)]
+unsafe impl PlainBytes for midnight_curves::G1Projective {}
 
 /// Storage backing for an SRS basis vector.
 pub(crate) enum BasesStorage<C: 'static> {
