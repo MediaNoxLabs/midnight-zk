@@ -30,10 +30,8 @@ mod error;
 pub(crate) mod evaluation;
 mod keygen;
 pub(crate) mod lookup;
-// S5 (P1, scaffold): mmap-backed PK loader infrastructure. Not yet
-// wired into ProvingKey::read — see docs/k21-s5-mmap-pk-design.md.
-// Spills batches of polynomials to a tempfile and maps them back, so
-// it needs both a filesystem to write to and `mmap(2)` to read from.
+// Mmap-backed proving-key and proof-time spill infrastructure. It needs both a
+// filesystem to write to and `mmap(2)` to read from.
 #[cfg(feature = "disk-spill")]
 pub(crate) mod mmap_pk;
 pub mod permutation;
@@ -349,7 +347,7 @@ pub struct ProvingKey<F: PrimeField, CS: PolynomialCommitmentScheme<F>> {
     pub(crate) fixed_cosets: Vec<Polynomial<F, ExtendedLagrangeCoeff>>,
     pub(crate) permutation: permutation::ProvingKey<F>,
     pub(crate) ev: Evaluator<F>,
-    /// S5 (P2): optional mmap-backed view of `fixed_polys`. When
+    /// Optional mmap-backed view of `fixed_polys`. When
     /// `Some`, the corresponding `fixed_polys` Vec above is empty
     /// and callers MUST read polynomials through
     /// [`ProvingKey::fixed_polys_views`]. Wrapped in `Arc` so PK
@@ -357,14 +355,12 @@ pub struct ProvingKey<F: PrimeField, CS: PolynomialCommitmentScheme<F>> {
     #[cfg(feature = "disk-spill")]
     pub(crate) fixed_polys_mmap: Option<std::sync::Arc<mmap_pk::MmappedPolys<F, Coeff>>>,
 
-    /// S5 (P3): optional mmap-backed view of `fixed_values`
-    /// (LagrangeCoeff basis, ~640 MiB at k=21). Same semantics as
+    /// Optional mmap-backed view of `fixed_values`. Same semantics as
     /// `fixed_polys_mmap`. Read via [`ProvingKey::fixed_values_views`].
     #[cfg(feature = "disk-spill")]
     pub(crate) fixed_values_mmap: Option<std::sync::Arc<mmap_pk::MmappedPolys<F, LagrangeCoeff>>>,
 
-    /// S5 (P3): optional mmap-backed view of `permutation.polys`
-    /// (Coeff basis, ~640 MiB at k=21). Same semantics as
+    /// Optional mmap-backed view of `permutation.polys`. Same semantics as
     /// `fixed_polys_mmap`. Read via
     /// [`ProvingKey::permutation_polys_views`]. Lives at the
     /// top-level PK rather than inside `permutation::ProvingKey`
@@ -373,12 +369,12 @@ pub struct ProvingKey<F: PrimeField, CS: PolynomialCommitmentScheme<F>> {
     pub(crate) permutation_polys_mmap: Option<std::sync::Arc<mmap_pk::MmappedPolys<F, Coeff>>>,
 }
 
-// S5 (P2): bound-free impl so the accessor + spill are available
+// Bound-free impl so the accessors and spill operations are available
 // from every code path that holds a `ProvingKey<F, CS>` — including
 // the `prover::create_proof` path which doesn't constrain
 // `F: FromUniformBytes<64>`.
 impl<F: PrimeField, CS: PolynomialCommitmentScheme<F>> ProvingKey<F, CS> {
-    /// S5 (P2): Read `fixed_polys` through a single accessor so the
+    /// Read `fixed_polys` through a single accessor so the
     /// in-place mmap-backed sidecar can transparently replace the
     /// heap `Vec` when engaged.
     ///
@@ -395,7 +391,7 @@ impl<F: PrimeField, CS: PolynomialCommitmentScheme<F>> ProvingKey<F, CS> {
         polynomial_views(&self.fixed_polys)
     }
 
-    /// S5 (P3): mirror of `fixed_polys_views` for `fixed_values`.
+    /// Mirror of `fixed_polys_views` for `fixed_values`.
     pub(crate) fn fixed_values_views(&self) -> Vec<PolynomialView<'_, F, LagrangeCoeff>> {
         #[cfg(feature = "disk-spill")]
         if let Some(m) = self.fixed_values_mmap.as_ref() {
@@ -404,7 +400,7 @@ impl<F: PrimeField, CS: PolynomialCommitmentScheme<F>> ProvingKey<F, CS> {
         polynomial_views(&self.fixed_values)
     }
 
-    /// S5 (P3): mirror of `fixed_polys_views` for `permutation.polys`.
+    /// Mirror of `fixed_polys_views` for `permutation.polys`.
     pub(crate) fn permutation_polys_views(&self) -> Vec<PolynomialView<'_, F, Coeff>> {
         #[cfg(feature = "disk-spill")]
         if let Some(m) = self.permutation_polys_mmap.as_ref() {
@@ -413,9 +409,9 @@ impl<F: PrimeField, CS: PolynomialCommitmentScheme<F>> ProvingKey<F, CS> {
         polynomial_views(&self.permutation.polys)
     }
 
-    /// S5 (P2): Move `fixed_polys` into mmap-backed storage.
+    /// Move `fixed_polys` into mmap-backed storage.
     /// See [`Self::spill_all_to_mmap`] for a one-shot variant that
-    /// also handles `fixed_values` and `permutation.polys` (P3).
+    /// also handles `fixed_values` and `permutation.polys`.
     #[cfg(feature = "disk-spill")]
     pub(crate) fn spill_fixed_polys_to_mmap(&mut self) -> std::io::Result<()> {
         if self.fixed_polys_mmap.is_some() {
@@ -431,9 +427,8 @@ impl<F: PrimeField, CS: PolynomialCommitmentScheme<F>> ProvingKey<F, CS> {
         Ok(())
     }
 
-    /// S5 (P3): Move `fixed_values` (LagrangeCoeff basis) into
+    /// Move `fixed_values` (LagrangeCoeff basis) into
     /// mmap-backed storage. Mirrors `spill_fixed_polys_to_mmap`.
-    /// Target: ~640 MiB phys_footprint relief at k=21.
     #[cfg(feature = "disk-spill")]
     pub(crate) fn spill_fixed_values_to_mmap(&mut self) -> std::io::Result<()> {
         if self.fixed_values_mmap.is_some() {
@@ -449,10 +444,9 @@ impl<F: PrimeField, CS: PolynomialCommitmentScheme<F>> ProvingKey<F, CS> {
         Ok(())
     }
 
-    /// S5 (P3): Move `permutation.polys` (Coeff basis) into
+    /// Move `permutation.polys` (Coeff basis) into
     /// mmap-backed storage. Sidecar lives at the top-level PK so
     /// `permutation::ProvingKey` stays clone-safe and small.
-    /// Target: ~640 MiB phys_footprint relief at k=21.
     #[cfg(feature = "disk-spill")]
     pub(crate) fn spill_permutation_polys_to_mmap(&mut self) -> std::io::Result<()> {
         if self.permutation_polys_mmap.is_some() {
@@ -468,15 +462,10 @@ impl<F: PrimeField, CS: PolynomialCommitmentScheme<F>> ProvingKey<F, CS> {
         Ok(())
     }
 
-    /// S5 (P3): one-shot — spill `fixed_polys`, `fixed_values`,
-    /// AND `permutation.polys` in sequence. Each step is
-    /// independently idempotent. Failures are best-effort: a
-    /// failure at any step is returned but earlier steps stay
-    /// applied (so partial relief is preserved).
-    ///
-    /// Combined target at k=21: ~2.6 GiB phys_footprint relief —
-    /// pulls iOS below the iPhone 16 Pro jetsam threshold and
-    /// makes real-device k=21 viable.
+    /// Spill `fixed_polys`, `fixed_values`, and `permutation.polys` in
+    /// sequence. Each step is independently idempotent. A failure is returned;
+    /// fields converted by earlier steps remain valid mapped storage, so a
+    /// caller retaining the key must deliberately handle the partial result.
     #[cfg(feature = "disk-spill")]
     pub(crate) fn spill_all_to_mmap(&mut self) -> std::io::Result<()> {
         self.spill_fixed_polys_to_mmap()?;
@@ -585,17 +574,11 @@ where
             #[cfg(feature = "disk-spill")]
             permutation_polys_mmap: None,
         };
-        // S5 (P2+P3): opt-in mmap-spill of fixed_polys +
-        // fixed_values + permutation.polys immediately after
-        // deserialise. Gated on `MIDNIGHT_SPILL_PK=1` so the
-        // default path stays bit-for-bit identical to the pre-S5
-        // behaviour. iOS sim k=21: combined target ~2.6 GiB
-        // of dirty-anon heap turned into clean file-backed pages
-        // (no `phys_footprint` contribution under the jetsam
-        // metric). A spill error must reject this load: the move into a
-        // sidecar can already have emptied one or more owned vectors, so
-        // silently returning the partially converted key would be unsound.
-        // The caller can retry the read explicitly with spilling disabled.
+        // Opt-in mmap spill immediately after deserialisation. The default path
+        // remains unchanged. A spill error must reject this load: the move into
+        // a sidecar can already have emptied one or more owned vectors, so
+        // silently returning the partially converted key would be invalid. The
+        // caller can retry the read explicitly with spilling disabled.
         #[cfg(feature = "disk-spill")]
         if matches!(
             std::env::var("MIDNIGHT_SPILL_PK").as_deref(),
