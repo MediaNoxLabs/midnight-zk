@@ -1,5 +1,5 @@
-//! S5 — generic mmap-backed polynomial spill (foundation for the
-//! mmap-backed Proving Key loader).
+//! Generic mmap-backed polynomial spill used by proving-key loading and
+//! proof-time coset construction.
 //!
 //! ## What this module provides
 //!
@@ -98,16 +98,14 @@ impl<F, B> MmappedPolys<F, B> {
     }
 
     /// Number of polynomials held.
-    // P3 consumers (ProvingKey integration) call this; suppress the
-    // dead-code warning while only the P1 surface ships.
+    // Kept for batch consumers that need to validate descriptor counts.
     #[allow(dead_code)]
     pub(crate) fn len(&self) -> usize {
         self.polys.len()
     }
 
     /// Whether the holder is empty.
-    // P3 consumers (ProvingKey integration) call this; suppress the
-    // dead-code warning while only the P1 surface ships.
+    // Kept for batch consumers that need to validate descriptor counts.
     #[allow(dead_code)]
     pub(crate) fn is_empty(&self) -> bool {
         self.polys.is_empty()
@@ -336,8 +334,7 @@ where
 /// Equivalent to `spill_iter_to_disk(polys.into_iter(), polys.len(),
 /// n_per_poly)` but the `Vec` is `drain(..)`'d in place so the Vec spine itself
 /// can be freed mid-loop on long batches.
-// P3 consumers (ProvingKey integration) call this; suppress the
-// dead-code warning while only the P1 surface ships.
+// Proving-key integration consumes this helper.
 #[allow(dead_code)]
 pub(crate) fn spill_vec_to_disk<F, B>(
     mut polys: Vec<Polynomial<F, B>>,
