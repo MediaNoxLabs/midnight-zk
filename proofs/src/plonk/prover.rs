@@ -376,7 +376,6 @@ fn sample_rss_hwm_kb() -> Option<(u64, u64)> {
 /// next `log_phase` boundary to panic with the sentinel; the FFI's
 /// `catch_unwind` maps the panic to `ProverError::Cancelled`. The
 /// flag is auto-reset by the FFI on every fresh prove call.
-#[allow(non_upper_case_globals)]
 pub static MIDNIGHT_CANCEL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
