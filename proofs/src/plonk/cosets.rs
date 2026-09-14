@@ -127,9 +127,14 @@ where
 
 #[cfg(test)]
 mod test {
+    // Every test in this module is `disk-spill`-only — the heap arm is
+    // exercised by the prover's own tests — so the imports are gated with
+    // them. Left ungated, `use super::*` is an unused import in the default
+    // build, which `-D warnings` rejects.
     #[cfg(feature = "disk-spill")]
     use midnight_curves::Fq as Fp;
 
+    #[cfg(feature = "disk-spill")]
     use super::*;
     #[cfg(feature = "disk-spill")]
     use crate::plonk::mmap_pk::spill_with_transform;
