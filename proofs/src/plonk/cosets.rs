@@ -7,13 +7,12 @@
 
 #[cfg(feature = "disk-spill")]
 use crate::plonk::mmap_pk::{spill_with_transform, MmappedPolys};
-use crate::poly::{Coeff, ExtendedLagrangeCoeff, Polynomial};
+use crate::poly::{polynomial_views, Coeff, ExtendedLagrangeCoeff, Polynomial, PolynomialView};
 
 /// Either heap-resident cosets or cosets spilled to a mapped tempfile.
 ///
-/// Both arms hand out `&[Polynomial<F, ExtendedLagrangeCoeff>]`, which is what
-/// `evaluate_numerator` already takes — so the choice is invisible to the
-/// evaluator and no call site changes shape.
+/// Both arms hand out basis-typed, read-only views, so storage choice remains
+/// invisible to the evaluator.
 pub(crate) enum Cosets<F> {
     /// The default: built in parallel and held in memory.
     Heap(Vec<Polynomial<F, ExtendedLagrangeCoeff>>),
@@ -36,12 +35,12 @@ impl<F> std::fmt::Debug for Cosets<F> {
 }
 
 impl<F> Cosets<F> {
-    /// Borrow as a flat slice, whichever arm this is.
-    pub(crate) fn as_slice(&self) -> &[Polynomial<F, ExtendedLagrangeCoeff>] {
+    /// Borrow as read-only views, whichever arm this is.
+    pub(crate) fn views(&self) -> Vec<PolynomialView<'_, F, ExtendedLagrangeCoeff>> {
         match self {
-            Cosets::Heap(v) => v,
+            Cosets::Heap(v) => polynomial_views(v),
             #[cfg(feature = "disk-spill")]
-            Cosets::Spilled(m) => m.as_slice(),
+            Cosets::Spilled(m) => m.views(),
         }
     }
 }
@@ -102,22 +101,30 @@ fn spill_decision(k: u32, enabled: bool, floor: u32) -> bool {
 /// A spill failure is **not** fatal: it falls back to the heap path and the
 /// proof is still produced. Running out of tempfile space should degrade to the
 /// behaviour we had before this optimisation existed, not abort a proof.
-pub(crate) fn build_cosets<F, D>(
-    polys: &[Polynomial<F, Coeff>],
-    k: u32,
-    to_extended: D,
-) -> Cosets<F>
+pub(crate) fn build_cosets<F, P, D>(polys: &[P], k: u32, to_extended: D) -> Cosets<F>
 where
-    F: Send + Sync,
-    D: Fn(&Polynomial<F, Coeff>) -> Polynomial<F, ExtendedLagrangeCoeff> + Send + Sync,
+    F: Copy + Send + Sync,
+    P: crate::poly::PolynomialRead<F, Basis = Coeff> + Sync,
+    D: for<'a> Fn(PolynomialView<'a, F, Coeff>) -> Polynomial<F, ExtendedLagrangeCoeff>
+        + Send
+        + Sync,
 {
     use rayon::prelude::*;
 
     #[cfg(feature = "disk-spill")]
     if should_spill_cosets(k) && !polys.is_empty() {
-        let n_per = to_extended(&polys[0]).values.len();
-        if let Ok(m) = spill_with_transform(polys, n_per, &to_extended) {
-            return Cosets::Spilled(m);
+        match spill_with_transform(polys, &to_extended) {
+            Ok(m) => return Cosets::Spilled(m),
+            Err(error) => {
+                tracing::warn!(%error, k, "coset spill failed; falling back to heap");
+                #[cfg(feature = "bench-internal")]
+                if matches!(
+                    std::env::var("MIDNIGHT_BENCH_REQUIRE_SPILL").as_deref(),
+                    Ok("1") | Ok("true")
+                ) {
+                    panic!("required benchmark coset spill failed at k={k}: {error}");
+                }
+            }
         }
     }
     // Without `disk-spill` the gate is dead weight; keep the parameter so the
@@ -128,7 +135,12 @@ where
     // streaming one polynomial at a time is what keeps peak heap at ~1 poly —
     // so the two arms trade throughput against memory, and the default path
     // must not quietly lose the parallelism it had before this existed.
-    Cosets::Heap(polys.par_iter().map(&to_extended).collect())
+    Cosets::Heap(
+        polys
+            .par_iter()
+            .map(|poly| to_extended(PolynomialView::new(poly.values())))
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -152,8 +164,8 @@ mod test {
                 _marker: std::marker::PhantomData,
             })
             .collect();
-        let widen = |p: &Polynomial<Fp, Coeff>| Polynomial::<Fp, ExtendedLagrangeCoeff> {
-            values: p.values.clone(),
+        let widen = |p: PolynomialView<'_, Fp, Coeff>| Polynomial::<Fp, ExtendedLagrangeCoeff> {
+            values: p.to_vec(),
             _marker: std::marker::PhantomData,
         };
 
@@ -161,13 +173,14 @@ mod test {
         // would make the test depend on process-wide environment another test
         // - or the caller's shell - may have set, which is exactly what
         // splitting `spill_decision` out was meant to avoid.
-        let heap = Cosets::Heap(polys.iter().map(widen).collect());
-        let n_per = widen(&polys[0]).values.len();
-        let spilled = Cosets::Spilled(spill_with_transform(&polys, n_per, widen).unwrap());
+        let heap = Cosets::Heap(polynomial_views(&polys).into_iter().map(widen).collect());
+        let spilled = Cosets::Spilled(spill_with_transform(&polys, widen).unwrap());
 
-        assert_eq!(heap.as_slice().len(), spilled.as_slice().len());
-        for (h, sp) in heap.as_slice().iter().zip(spilled.as_slice()) {
-            assert_eq!(h.values, sp.values, "spilled cosets must equal heap cosets");
+        let heap = heap.views();
+        let spilled = spilled.views();
+        assert_eq!(heap.len(), spilled.len());
+        for (h, sp) in heap.iter().zip(&spilled) {
+            assert_eq!(&h[..], &sp[..], "spilled cosets must equal heap cosets");
         }
     }
 

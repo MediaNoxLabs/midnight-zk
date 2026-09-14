@@ -3,7 +3,7 @@ use std::fmt::Debug;
 use ff::PrimeField;
 
 use crate::{
-    poly::{commitment::PolynomialCommitmentScheme, Coeff, Polynomial},
+    poly::{commitment::PolynomialCommitmentScheme, Coeff, Polynomial, PolynomialView},
     utils::arithmetic::eval_polynomial,
 };
 
@@ -22,7 +22,7 @@ pub struct ProverQuery<'com, F: PrimeField> {
     /// Point at which polynomial is queried
     pub(crate) point: F,
     /// Coefficients of polynomial
-    pub(crate) poly: &'com Polynomial<F, Coeff>,
+    pub(crate) poly: PolynomialView<'com, F, Coeff>,
 }
 
 impl<'com, F> ProverQuery<'com, F>
@@ -31,6 +31,14 @@ where
 {
     /// Create a new prover query based on a polynomial
     pub fn new(point: F, poly: &'com Polynomial<F, Coeff>) -> Self {
+        ProverQuery {
+            point,
+            poly: PolynomialView::new(poly),
+        }
+    }
+
+    /// Create a query over any storage already normalised to a read-only view.
+    pub(crate) fn from_view(point: F, poly: PolynomialView<'com, F, Coeff>) -> Self {
         ProverQuery { point, poly }
     }
 }
@@ -38,12 +46,12 @@ where
 #[doc(hidden)]
 #[derive(Copy, Clone, Debug)]
 pub struct PolynomialPointer<'com, F: PrimeField> {
-    pub(crate) poly: &'com Polynomial<F, Coeff>,
+    pub(crate) poly: PolynomialView<'com, F, Coeff>,
 }
 
 impl<F: PrimeField> PartialEq for PolynomialPointer<'_, F> {
     fn eq(&self, other: &Self) -> bool {
-        std::ptr::eq(self.poly, other.poly)
+        std::ptr::eq(&self.poly[..], &other.poly[..])
     }
 }
 

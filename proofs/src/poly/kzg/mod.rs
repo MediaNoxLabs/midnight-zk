@@ -36,6 +36,7 @@ use crate::{
             params::{ParamsKZG, ParamsVerifierKZG},
             utils::construct_intermediate_sets,
         },
+        polynomial_inner_product,
         query::VerifierQuery,
         Coeff, Error, LagrangeCoeff, Polynomial, ProverQuery,
     },
@@ -122,7 +123,7 @@ where
         let mut q_polys = vec![vec![]; point_sets.len()];
 
         for com_data in poly_map.iter() {
-            q_polys[com_data.set_index].push(com_data.commitment.poly.clone());
+            q_polys[com_data.set_index].push(com_data.commitment.poly);
         }
 
         let q_polys = q_polys
@@ -134,7 +135,7 @@ where
                 #[cfg(not(feature = "truncated-challenges"))]
                 let x1 = powers(x1);
 
-                inner_product(polys, x1)
+                polynomial_inner_product(polys, x1)
             })
             .collect::<Vec<_>>();
 
@@ -466,18 +467,9 @@ mod tests {
         transcript.write(&cvy).unwrap();
 
         let queries = [
-            ProverQuery {
-                point: x,
-                poly: &ax,
-            },
-            ProverQuery {
-                point: x,
-                poly: &bx,
-            },
-            ProverQuery {
-                point: y,
-                poly: &cx,
-            },
+            ProverQuery::new(x, &ax),
+            ProverQuery::new(x, &bx),
+            ProverQuery::new(y, &cx),
         ]
         .into_iter();
 

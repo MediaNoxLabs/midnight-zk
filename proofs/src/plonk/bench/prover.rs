@@ -3,6 +3,8 @@
 use std::hash::Hash;
 
 use criterion::BenchmarkGroup;
+#[cfg(feature = "disk-spill")]
+use ff::PrimeField;
 use ff::{FromUniformBytes, WithSmallOrderMulGroup};
 use rand_core::{CryptoRng, RngCore};
 
@@ -17,7 +19,7 @@ use crate::{
         traces::ProverTrace,
         trash, vanishing, Error, ProvingKey,
     },
-    poly::commitment::PolynomialCommitmentScheme,
+    poly::{commitment::PolynomialCommitmentScheme, polynomial_views},
     transcript::{Hashable, Sampleable, Transcript},
 };
 
@@ -144,9 +146,9 @@ where
                                         params,
                                         domain,
                                         theta,
-                                        &advice.advice_polys,
-                                        &pk.fixed_values,
-                                        &instance.instance_values,
+                                        &polynomial_views(&advice.advice_polys),
+                                        &pk.fixed_values_views(),
+                                        &polynomial_views(&instance.instance_values),
                                         &challenges,
                                         rng,
                                         &mut t,
@@ -174,9 +176,9 @@ where
                             params,
                             domain,
                             theta,
-                            &advice.advice_polys,
-                            &pk.fixed_values,
-                            &instance.instance_values,
+                            &polynomial_views(&advice.advice_polys),
+                            &pk.fixed_values_views(),
+                            &polynomial_views(&instance.instance_values),
                             &challenges,
                             rng,
                             transcript,
@@ -207,9 +209,9 @@ where
                                 params,
                                 pk,
                                 &pk.permutation,
-                                &advice.advice_polys,
-                                &pk.fixed_values,
-                                &instance.instance_values,
+                                &polynomial_views(&advice.advice_polys),
+                                &pk.fixed_values_views(),
+                                &polynomial_views(&instance.instance_values),
                                 beta,
                                 gamma,
                                 rng,
@@ -229,9 +231,9 @@ where
                     params,
                     pk,
                     &pk.permutation,
-                    &advice.advice_polys,
-                    &pk.fixed_values,
-                    &instance.instance_values,
+                    &polynomial_views(&advice.advice_polys),
+                    &pk.fixed_values_views(),
+                    &polynomial_views(&instance.instance_values),
                     beta,
                     gamma,
                     rng,
@@ -295,9 +297,9 @@ where
                                         params,
                                         domain,
                                         trash_challenge,
-                                        &advice.advice_polys,
-                                        &pk.fixed_values,
-                                        &instance.instance_values,
+                                        &polynomial_views(&advice.advice_polys),
+                                        &pk.fixed_values_views(),
+                                        &polynomial_views(&instance.instance_values),
                                         &challenges,
                                         &mut t,
                                     )
@@ -322,9 +324,9 @@ where
                             params,
                             domain,
                             trash_challenge,
-                            &advice.advice_polys,
-                            &pk.fixed_values,
-                            &instance.instance_values,
+                            &polynomial_views(&advice.advice_polys),
+                            &pk.fixed_values_views(),
+                            &polynomial_views(&instance.instance_values),
                             &challenges,
                             transcript,
                         )
@@ -486,16 +488,17 @@ where
     };
 
     // Evaluate common permutation data
+    let permutation_polys = pk.permutation_polys_views();
     group.bench_function("Evaluate permutation data", |b| {
         b.iter_batched(
             || transcript.clone(),
             |mut t| {
-                let _ = pk.permutation.evaluate(x, &mut t);
+                let _ = pk.permutation.evaluate(&permutation_polys, x, &mut t);
             },
             criterion::BatchSize::SmallInput,
         )
     });
-    pk.permutation.evaluate(x, transcript)?;
+    pk.permutation.evaluate(&permutation_polys, x, transcript)?;
 
     // Evaluate the permutations, if any, at omega^i x.
     let permutations: Vec<permutation::prover::Evaluated<F>> = permutations
@@ -564,6 +567,21 @@ where
         )
     });
     CS::multi_open(params, &queries, transcript).map_err(|_| Error::ConstraintSystemFailure)
+}
+
+/// Moves the proving-key polynomials into their mmap-backed representation.
+///
+/// This is exposed only with the benchmark API: production consumers select
+/// the same path while deserializing a key with `MIDNIGHT_SPILL_PK=1`, whereas
+/// a benchmark already owns a freshly generated key and needs to prepare it
+/// without including a serialize/read cycle in the measurement.
+#[cfg(feature = "disk-spill")]
+pub fn spill_proving_key<F, CS>(pk: &mut ProvingKey<F, CS>) -> std::io::Result<()>
+where
+    F: PrimeField,
+    CS: PolynomialCommitmentScheme<F>,
+{
+    pk.spill_all_to_mmap()
 }
 
 /// Benchmarked version of proof creation that measures each internal step.
