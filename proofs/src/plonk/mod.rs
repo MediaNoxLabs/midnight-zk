@@ -14,8 +14,8 @@ use crate::{
         vanishing::verifier::{Evaluated, PartiallyEvaluated},
     },
     poly::{
-        Coeff, EvaluationDomain, ExtendedLagrangeCoeff, LagrangeCoeff, PinnedEvaluationDomain,
-        Polynomial,
+        polynomial_views, Coeff, EvaluationDomain, ExtendedLagrangeCoeff, LagrangeCoeff,
+        PinnedEvaluationDomain, Polynomial, PolynomialView,
     },
     transcript::{Hashable, Transcript},
     utils::{
@@ -356,21 +356,21 @@ pub struct ProvingKey<F: PrimeField, CS: PolynomialCommitmentScheme<F>> {
     /// S5 (P2): optional mmap-backed view of `fixed_polys`. When
     /// `Some`, the corresponding `fixed_polys` Vec above is empty
     /// and callers MUST read polynomials through
-    /// [`ProvingKey::fixed_polys_slice`]. Wrapped in `Arc` so PK
+    /// [`ProvingKey::fixed_polys_views`]. Wrapped in `Arc` so PK
     /// `clone()` shares the underlying mmap + tempfile.
     #[cfg(feature = "disk-spill")]
     pub(crate) fixed_polys_mmap: Option<std::sync::Arc<mmap_pk::MmappedPolys<F, Coeff>>>,
 
     /// S5 (P3): optional mmap-backed view of `fixed_values`
     /// (LagrangeCoeff basis, ~640 MiB at k=21). Same semantics as
-    /// `fixed_polys_mmap`. Read via [`ProvingKey::fixed_values_slice`].
+    /// `fixed_polys_mmap`. Read via [`ProvingKey::fixed_values_views`].
     #[cfg(feature = "disk-spill")]
     pub(crate) fixed_values_mmap: Option<std::sync::Arc<mmap_pk::MmappedPolys<F, LagrangeCoeff>>>,
 
     /// S5 (P3): optional mmap-backed view of `permutation.polys`
     /// (Coeff basis, ~640 MiB at k=21). Same semantics as
     /// `fixed_polys_mmap`. Read via
-    /// [`ProvingKey::permutation_polys_slice`]. Lives at the
+    /// [`ProvingKey::permutation_polys_views`]. Lives at the
     /// top-level PK rather than inside `permutation::ProvingKey`
     /// to keep the permutation type clone-safe and small.
     #[cfg(feature = "disk-spill")]
@@ -390,31 +390,31 @@ impl<F: PrimeField, CS: PolynomialCommitmentScheme<F>> ProvingKey<F, CS> {
     /// vector is empty and the polynomials live in mmap'd file
     /// pages. When `None`, the legacy heap vector is returned.
     /// Callers that previously indexed `&pk.fixed_polys[i]` should
-    /// now use `&pk.fixed_polys_slice()[i]`.
-    pub(crate) fn fixed_polys_slice(&self) -> &[Polynomial<F, Coeff>] {
+    /// now normalise once with `pk.fixed_polys_views()`.
+    pub(crate) fn fixed_polys_views(&self) -> Vec<PolynomialView<'_, F, Coeff>> {
         #[cfg(feature = "disk-spill")]
         if let Some(m) = self.fixed_polys_mmap.as_ref() {
-            return m.as_slice();
+            return m.views();
         }
-        &self.fixed_polys
+        polynomial_views(&self.fixed_polys)
     }
 
-    /// S5 (P3): mirror of `fixed_polys_slice` for `fixed_values`.
-    pub(crate) fn fixed_values_slice(&self) -> &[Polynomial<F, LagrangeCoeff>] {
+    /// S5 (P3): mirror of `fixed_polys_views` for `fixed_values`.
+    pub(crate) fn fixed_values_views(&self) -> Vec<PolynomialView<'_, F, LagrangeCoeff>> {
         #[cfg(feature = "disk-spill")]
         if let Some(m) = self.fixed_values_mmap.as_ref() {
-            return m.as_slice();
+            return m.views();
         }
-        &self.fixed_values
+        polynomial_views(&self.fixed_values)
     }
 
-    /// S5 (P3): mirror of `fixed_polys_slice` for `permutation.polys`.
-    pub(crate) fn permutation_polys_slice(&self) -> &[Polynomial<F, Coeff>] {
+    /// S5 (P3): mirror of `fixed_polys_views` for `permutation.polys`.
+    pub(crate) fn permutation_polys_views(&self) -> Vec<PolynomialView<'_, F, Coeff>> {
         #[cfg(feature = "disk-spill")]
         if let Some(m) = self.permutation_polys_mmap.as_ref() {
-            return m.as_slice();
+            return m.views();
         }
-        &self.permutation.polys
+        polynomial_views(&self.permutation.polys)
     }
 
     /// S5 (P2): Move `fixed_polys` into mmap-backed storage.
@@ -501,9 +501,10 @@ where
 
     /// Gets the total number of bytes in the serialization of `self`
     pub fn bytes_length(&self, format: SerdeFormat) -> usize {
+        let fixed_values = self.fixed_values_views();
         self.vk.bytes_length(format)
             + 12 // bytes used for encoding the length(u32) of "l0", "l_last" & "l_active_row" polys
-            + polynomial_slice_byte_length(&self.fixed_values)
+            + polynomial_slice_byte_length(&fixed_values)
             + self.permutation.bytes_length()
     }
 }
@@ -525,7 +526,7 @@ where
     ///   serializing the rest of the data (in the form of field polynomials)
     pub fn write<W: io::Write>(&self, writer: &mut W, format: SerdeFormat) -> io::Result<()> {
         self.vk.write(writer, format)?;
-        write_polynomial_slice(&self.fixed_values, writer)?;
+        write_polynomial_slice(&self.fixed_values_views(), writer)?;
         self.permutation.write(writer)?;
         Ok(())
     }
@@ -595,11 +596,16 @@ where
         // behaviour. iOS sim k=21: combined target ~2.6 GiB
         // of dirty-anon heap turned into clean file-backed pages
         // (no `phys_footprint` contribution under the jetsam
-        // metric). Failures are best-effort — earlier successful
-        // spills are kept; subsequent ones return the io::Error.
+        // metric). A spill error must reject this load: the move into a
+        // sidecar can already have emptied one or more owned vectors, so
+        // silently returning the partially converted key would be unsound.
+        // The caller can retry the read explicitly with spilling disabled.
         #[cfg(feature = "disk-spill")]
-        if matches!(std::env::var("MIDNIGHT_SPILL_PK").as_deref(), Ok("1")) {
-            let _ = pk.spill_all_to_mmap();
+        if matches!(
+            std::env::var("MIDNIGHT_SPILL_PK").as_deref(),
+            Ok("1") | Ok("true")
+        ) {
+            pk.spill_all_to_mmap()?;
         }
         Ok(pk)
     }

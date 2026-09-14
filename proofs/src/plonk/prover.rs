@@ -30,8 +30,9 @@ use crate::{
     circuit::Value,
     plonk::{traces::ProverTrace, trash},
     poly::{
-        batch_invert_rational, commitment::PolynomialCommitmentScheme, Coeff,
-        ExtendedLagrangeCoeff, LagrangeCoeff, Polynomial, PolynomialRepresentation, ProverQuery,
+        batch_invert_rational, commitment::PolynomialCommitmentScheme, polynomial_views, Coeff,
+        ExtendedLagrangeCoeff, LagrangeCoeff, Polynomial, PolynomialRepresentation, PolynomialView,
+        ProverQuery,
     },
     transcript::{Hashable, Sampleable, Transcript},
     utils::{arithmetic::eval_polynomial, rational::Rational},
@@ -115,6 +116,7 @@ where
     log_phase("trace.parse_advices.start");
     let (advice, challenges) = parse_advices(params, pk, circuits, instances, transcript, rng)?;
     log_phase("trace.parse_advices.end");
+    let fixed_value_views = pk.fixed_values_views();
 
     // Sample theta challenge for keeping lookup columns linearly independent
     let theta: F = transcript.squeeze_challenge();
@@ -124,6 +126,8 @@ where
         .iter()
         .zip(advice.iter())
         .map(|(instance, advice)| -> Result<Vec<_>, Error> {
+            let advice_views = polynomial_views(&advice.advice_polys);
+            let instance_views = polynomial_views(&instance.instance_values);
             // Construct and commit to permuted values for each lookup
             pk.vk
                 .cs
@@ -135,9 +139,9 @@ where
                         params,
                         domain,
                         theta,
-                        &advice.advice_polys,
-                        pk.fixed_values_slice(),
-                        &instance.instance_values,
+                        &advice_views,
+                        &fixed_value_views,
+                        &instance_views,
                         &challenges,
                         rng,
                         transcript,
@@ -161,13 +165,15 @@ where
         .iter()
         .zip(advice.iter())
         .map(|(instance, advice)| {
+            let advice_views = polynomial_views(&advice.advice_polys);
+            let instance_views = polynomial_views(&instance.instance_values);
             pk.vk.cs.permutation.commit(
                 params,
                 pk,
                 &pk.permutation,
-                &advice.advice_polys,
-                pk.fixed_values_slice(),
-                &instance.instance_values,
+                &advice_views,
+                &fixed_value_views,
+                &instance_views,
                 beta,
                 gamma,
                 rng,
@@ -198,6 +204,8 @@ where
         .iter()
         .zip(advice.iter())
         .map(|(instance, advice)| -> Result<Vec<_>, Error> {
+            let advice_views = polynomial_views(&advice.advice_polys);
+            let instance_views = polynomial_views(&instance.instance_values);
             pk.vk
                 .cs
                 .trashcans
@@ -207,9 +215,9 @@ where
                         params,
                         domain,
                         trash_challenge,
-                        &advice.advice_polys,
-                        pk.fixed_values_slice(),
-                        &instance.instance_values,
+                        &advice_views,
+                        &fixed_value_views,
+                        &instance_views,
                         &challenges,
                         transcript,
                     )
@@ -472,7 +480,8 @@ where
     let vanishing = vanishing.evaluate(x, domain, transcript)?;
 
     // Evaluate common permutation data
-    pk.permutation.evaluate(x, transcript)?;
+    let permutation_polys = pk.permutation_polys_views();
+    pk.permutation.evaluate(&permutation_polys, x, transcript)?;
 
     // Evaluate the permutations, if any, at omega^i x.
     let permutations: Vec<permutation::prover::Evaluated<F>> = permutations
@@ -831,7 +840,7 @@ pub(super) fn compute_nu_poly<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommit
                 log_phase("finalise.compute_h_poly.spill_advice_cosets.start");
             }
             let c = build_cosets(advice_polys, k, |poly| {
-                pk.vk.get_domain().coeff_to_extended(poly.clone())
+                pk.vk.get_domain().coeff_to_extended(poly.materialise())
             });
             if narrate_spill {
                 log_phase("finalise.compute_h_poly.spill_advice_cosets.end");
@@ -846,7 +855,7 @@ pub(super) fn compute_nu_poly<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommit
                 log_phase("finalise.compute_h_poly.spill_instance_cosets.start");
             }
             let c = build_cosets(instance_polys, k, |poly| {
-                pk.vk.get_domain().coeff_to_extended(poly.clone())
+                pk.vk.get_domain().coeff_to_extended(poly.materialise())
             });
             if narrate_spill {
                 log_phase("finalise.compute_h_poly.spill_instance_cosets.end");
@@ -888,54 +897,65 @@ pub(super) fn compute_nu_poly<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommit
     // function. Reuse `want_spill_advice` here as the shared spill
     // gate so all four coset categories (fixed/perm/advice/instance)
     // follow the same env-var contract.
-    let built_fixed_cosets;
-    let fixed_cosets_ref: &[crate::poly::Polynomial<F, ExtendedLagrangeCoeff>] =
-        if !pk.fixed_cosets.is_empty() {
-            &pk.fixed_cosets
+    let built_fixed_cosets = if !pk.fixed_cosets.is_empty() {
+        None
+    } else {
+        // S5 (P2): read through `fixed_polys_views()` so the
+        // mmap-backed sidecar is consulted first when engaged.
+        // `build_cosets` picks the arm; the marker names stay split
+        // so downstream consumers that match on them see the same
+        // strings for the same behaviour as before.
+        log_phase(if narrate_spill {
+            "finalise.compute_h_poly.spill_fixed_cosets.start"
         } else {
-            // S5 (P2): read through `fixed_polys_slice()` so the
-            // mmap-backed sidecar is consulted first when engaged.
-            // `build_cosets` picks the arm; the marker names stay split
-            // so downstream consumers that match on them see the same
-            // strings for the same behaviour as before.
-            log_phase(if narrate_spill {
-                "finalise.compute_h_poly.spill_fixed_cosets.start"
-            } else {
-                "finalise.compute_h_poly.materialise_fixed_cosets.start"
-            });
-            built_fixed_cosets = build_cosets(pk.fixed_polys_slice(), k, |p| {
-                pk.vk.domain.coeff_to_extended(p.clone())
-            });
-            log_phase(if narrate_spill {
-                "finalise.compute_h_poly.spill_fixed_cosets.end"
-            } else {
-                "finalise.compute_h_poly.materialise_fixed_cosets.end"
-            });
-            built_fixed_cosets.as_slice()
-        };
+            "finalise.compute_h_poly.materialise_fixed_cosets.start"
+        });
+        let fixed_polys = pk.fixed_polys_views();
+        let built = build_cosets(&fixed_polys, k, |p| {
+            pk.vk.domain.coeff_to_extended(p.materialise())
+        });
+        log_phase(if narrate_spill {
+            "finalise.compute_h_poly.spill_fixed_cosets.end"
+        } else {
+            "finalise.compute_h_poly.materialise_fixed_cosets.end"
+        });
+        Some(built)
+    };
+    let fixed_cosets = match &built_fixed_cosets {
+        Some(cosets) => cosets.views(),
+        None => polynomial_views(&pk.fixed_cosets),
+    };
 
-    let built_perm_cosets;
-    let perm_cosets_ref: &[crate::poly::Polynomial<F, ExtendedLagrangeCoeff>] =
-        if !pk.permutation.cosets.is_empty() {
-            &pk.permutation.cosets
+    let built_perm_cosets = if !pk.permutation.cosets.is_empty() {
+        None
+    } else {
+        // Reads through `permutation_polys_views()` so the S5-P3
+        // mmap-backed sidecar is consulted first.
+        log_phase(if narrate_spill {
+            "finalise.compute_h_poly.spill_perm_cosets.start"
         } else {
-            // Reads through `permutation_polys_slice()` so the S5-P3
-            // mmap-backed sidecar is consulted first.
-            log_phase(if narrate_spill {
-                "finalise.compute_h_poly.spill_perm_cosets.start"
-            } else {
-                "finalise.compute_h_poly.materialise_perm_cosets.start"
-            });
-            built_perm_cosets = build_cosets(pk.permutation_polys_slice(), k, |p| {
-                pk.vk.domain.coeff_to_extended(p.clone())
-            });
-            log_phase(if narrate_spill {
-                "finalise.compute_h_poly.spill_perm_cosets.end"
-            } else {
-                "finalise.compute_h_poly.materialise_perm_cosets.end"
-            });
-            built_perm_cosets.as_slice()
-        };
+            "finalise.compute_h_poly.materialise_perm_cosets.start"
+        });
+        let permutation_polys = pk.permutation_polys_views();
+        let built = build_cosets(&permutation_polys, k, |p| {
+            pk.vk.domain.coeff_to_extended(p.materialise())
+        });
+        log_phase(if narrate_spill {
+            "finalise.compute_h_poly.spill_perm_cosets.end"
+        } else {
+            "finalise.compute_h_poly.materialise_perm_cosets.end"
+        });
+        Some(built)
+    };
+    let permutation_cosets = match &built_perm_cosets {
+        Some(cosets) => cosets.views(),
+        None => polynomial_views(&pk.permutation.cosets),
+    };
+
+    let advice_coset_views: Vec<Vec<_>> = advice_cosets.iter().map(Cosets::views).collect();
+    let advice_coset_slices: Vec<&[_]> = advice_coset_views.iter().map(Vec::as_slice).collect();
+    let instance_coset_views: Vec<Vec<_>> = instance_cosets.iter().map(Cosets::views).collect();
+    let instance_coset_slices: Vec<&[_]> = instance_coset_views.iter().map(Vec::as_slice).collect();
 
     // Evaluate the h(X) polynomial
     // Upstream renamed evaluate_h -> evaluate_numerator; this returns the
@@ -944,9 +964,9 @@ pub(super) fn compute_nu_poly<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommit
     let h_poly = pk.ev.evaluate_numerator::<ExtendedLagrangeCoeff>(
         &pk.vk.domain,
         &pk.vk.cs,
-        &advice_cosets.iter().map(|a| a.as_slice()).collect::<Vec<_>>(),
-        &instance_cosets.iter().map(|i| i.as_slice()).collect::<Vec<_>>(),
-        fixed_cosets_ref,
+        &advice_coset_slices,
+        &instance_coset_slices,
+        &fixed_cosets,
         challenges,
         *y,
         *beta,
@@ -956,10 +976,10 @@ pub(super) fn compute_nu_poly<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommit
         lookups,
         trashcans,
         permutations,
-        &pk.l0,
-        &pk.l_last,
-        &pk.l_active_row,
-        perm_cosets_ref,
+        PolynomialView::new(&pk.l0),
+        PolynomialView::new(&pk.l_last),
+        PolynomialView::new(&pk.l_active_row),
+        &permutation_cosets,
     );
     // `computed_fixed_cosets` / `computed_perm_cosets` (if we built
     // them) drop here — releasing both extended-domain expansions
@@ -1013,14 +1033,12 @@ where
     }
 
     // Compute and hash fixed evals (shared across all circuit instances)
+    let fixed_polys = pk.fixed_polys_views();
     let fixed_evals: Vec<_> = meta
         .fixed_queries
         .iter()
         .map(|&(column, at)| {
-            eval_polynomial(
-                &pk.fixed_polys_slice()[column.index()],
-                domain.rotate_omega(x, at),
-            )
+            eval_polynomial(&fixed_polys[column.index()][..], domain.rotate_omega(x, at))
         })
         .collect();
 
@@ -1049,6 +1067,8 @@ pub(super) fn compute_queries<
     x: F,
 ) -> Vec<ProverQuery<'a, F>> {
     let domain = pk.vk.get_domain();
+    let fixed_polys = pk.fixed_polys_views();
+    let permutation_polys = pk.permutation_polys_views();
     instance_polys
         .iter()
         .zip(advice_polys.iter())
@@ -1058,19 +1078,16 @@ pub(super) fn compute_queries<
         .flat_map(
             move |((((instance, advice), permutation), lookups), trash)| {
                 iter::empty()
-                    .chain(
-                        pk.vk.cs.advice_queries.iter().map(move |&(column, at)| ProverQuery {
-                            point: domain.rotate_omega(x, at),
-                            poly: &advice[column.index()],
-                        }),
-                    )
+                    .chain(pk.vk.cs.advice_queries.iter().map(move |&(column, at)| {
+                        ProverQuery::new(domain.rotate_omega(x, at), &advice[column.index()])
+                    }))
                     .chain(
                         pk.vk.cs.instance_queries.iter().filter_map(move |&(column, at)| {
                             if column.index() < nb_committed_instances {
-                                Some(ProverQuery {
-                                    point: domain.rotate_omega(x, at),
-                                    poly: &instance[column.index()],
-                                })
+                                Some(ProverQuery::new(
+                                    domain.rotate_omega(x, at),
+                                    &instance[column.index()],
+                                ))
                             } else {
                                 None
                             }
@@ -1081,13 +1098,10 @@ pub(super) fn compute_queries<
                     .chain(trash.iter().flat_map(move |p| p.open(x)))
             },
         )
-        .chain(
-            pk.vk.cs.fixed_queries.iter().map(move |&(column, at)| ProverQuery {
-                point: domain.rotate_omega(x, at),
-                poly: &pk.fixed_polys_slice()[column.index()],
-            }),
-        )
-        .chain(pk.permutation.open(x))
+        .chain(pk.vk.cs.fixed_queries.iter().map(|&(column, at)| {
+            ProverQuery::from_view(domain.rotate_omega(x, at), fixed_polys[column.index()])
+        }))
+        .chain(permutation_polys.iter().copied().map(|poly| ProverQuery::from_view(x, poly)))
         // We query the h(X) polynomial at x
         .chain(vanishing.open(x))
         .collect::<Vec<_>>()
@@ -1284,7 +1298,20 @@ fn test_create_proof() {
     let params: ParamsKZG<Bn256> = ParamsKZG::unsafe_setup(K, OsRng);
     let vk = keygen_vk_with_k::<Fr, KZGCommitmentScheme<Bn256>, _>(&params, &MyCircuit, K)
         .expect("keygen_vk should not fail");
-    let pk = keygen_pk(vk, &MyCircuit).expect("keygen_pk should not fail");
+    #[cfg_attr(not(feature = "disk-spill"), allow(unused_mut))]
+    let mut pk = keygen_pk(vk, &MyCircuit).expect("keygen_pk should not fail");
+    #[cfg(feature = "disk-spill")]
+    {
+        use crate::utils::SerdeFormat;
+
+        let expected = pk.to_bytes(SerdeFormat::RawBytesUnchecked);
+        pk.spill_all_to_mmap().expect("PK spill should not fail");
+        assert_eq!(
+            pk.to_bytes(SerdeFormat::RawBytesUnchecked),
+            expected,
+            "spilling storage must not change PK serialization"
+        );
+    }
     let mut transcript = CircuitTranscript::<_>::init();
 
     // Create proof with wrong number of instances

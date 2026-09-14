@@ -3,17 +3,17 @@
 //!
 //! ## What this module provides
 //!
-//! [`MmappedPolys<F, B>`] — a holder for a batch of `Polynomial<F, B>`
-//! values that live in a tempfile mmap'd into the process address
-//! space. The Polynomial views into the mmap are wrapped in
-//! `ManuallyDrop` so the global allocator never tries to `free` a
-//! pointer it doesn't own; the mapping (and the underlying tempfile)
-//! are cleaned up when the holder is dropped.
+//! [`MmappedPolys<F, B>`] — a holder for a batch of polynomial values
+//! that live in a tempfile mmap'd into the process address space. Each
+//! polynomial is an `Arc<Mmap>` plus a checked offset and length; no
+//! allocator-owned collection is forged over mapped pages. The backing
+//! tempfile is unnamed, so a crash does not leave witness material at a
+//! discoverable path.
 //!
 //! [`spill_iter_to_disk`] — the canonical spill primitive. Consumes
-//! an iterator of `Polynomial<F, B>`, streams each one's raw bytes to
-//! a tempfile (one polynomial at a time so peak heap stays at ~1
-//! poly), mmaps the file, and returns an `MmappedPolys` view.
+//! an iterator of `Polynomial<F, B>`, moves each live field value into
+//! a mutable tempfile mapping (one polynomial at a time so peak heap
+//! stays at ~1 poly), makes it read-only, and returns typed views.
 //!
 //! [`spill_with_transform`] — convenience that applies a per-element
 //! transform (e.g. `coeff_to_extended`) on the fly so the SpilledCosets
@@ -35,30 +35,47 @@
 //! the public API keeps the typing strong so the compiler enforces
 //! the invariant.
 
-use std::{io, marker::PhantomData, mem::ManuallyDrop, sync::Arc};
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+use std::io::Write;
+use std::{io, marker::PhantomData, sync::Arc};
 
-use crate::poly::Polynomial;
+use crate::poly::{polynomial_views, Polynomial, PolynomialRead, PolynomialView};
 
-/// Read-only batch of polynomials whose `values: Vec<F>` storage is
-/// a non-owning view into a mmap'd tempfile.
+/// One polynomial backed by a read-only mmap. Offsets are stored instead of
+/// raw pointers, so moving or cloning this value cannot invalidate anything.
+#[derive(Clone)]
+struct MappedPolynomial<F, B> {
+    mmap: Arc<memmap2::Mmap>,
+    offset: usize,
+    len: usize,
+    _marker: PhantomData<(F, B)>,
+}
+
+impl<F, B> PolynomialRead<F> for MappedPolynomial<F, B> {
+    type Basis = B;
+
+    fn values(&self) -> &[F] {
+        // SAFETY: `spill_iter_to_disk` sizes and aligns the mapping, writes a
+        // live `F` to every element with `ptr::write`, and constructs offsets
+        // wholly inside it. The Arc keeps the mapping alive and read-only.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::slice::from_raw_parts(self.mmap.as_ptr().add(self.offset) as *const F, self.len)
+        }
+    }
+}
+
+/// Read-only batch of polynomials backed by a mapped tempfile.
 ///
-/// The struct holds three pieces, in this drop order:
-///   1. `polys` — `Vec<ManuallyDrop<Polynomial<F, B>>>`. Dropping the vec frees
-///      the outer Vec spine but does NOT run the inner Polynomial destructors
-///      (those would call `free` on mmap pointers).
-///   2. `_mmap` — `Arc<Mmap>`. When the refcount hits zero the OS unmaps the
-///      file pages.
-///   3. `_tmp_path` — `tempfile::TempPath`. Drop deletes the underlying file
-///      from disk.
+/// The struct holds mapped polynomial descriptors (`Arc<Mmap>` + offset +
+/// length). The file descriptor used to create the mapping is closed before
+/// this value is returned; the tempfile itself is unnamed.
 ///
-/// `Sync`/`Send`: the inner `Polynomial<F, B>` values are read-only
-/// views; the struct is `Send + Sync` whenever `F: Send + Sync` and
-/// `B: Send + Sync`. (The compiler derives these automatically from
-/// the field types.)
+/// `Sync`/`Send`: the descriptors are read-only; the compiler derives these
+/// traits from `F`, `B`, and `Mmap`.
 pub(crate) struct MmappedPolys<F, B> {
-    polys: Vec<ManuallyDrop<Polynomial<F, B>>>,
-    _mmap: Arc<memmap2::Mmap>,
-    _tmp_path: tempfile::TempPath,
+    polys: Vec<MappedPolynomial<F, B>>,
+    mmap_bytes: usize,
 }
 
 impl<F, B> std::fmt::Debug for MmappedPolys<F, B> {
@@ -69,27 +86,15 @@ impl<F, B> std::fmt::Debug for MmappedPolys<F, B> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MmappedPolys")
             .field("n_polys", &self.polys.len())
-            .field("mmap_bytes", &self._mmap.len())
+            .field("mmap_bytes", &self.mmap_bytes)
             .finish()
     }
 }
 
 impl<F, B> MmappedPolys<F, B> {
-    /// Borrow the polynomials as a flat slice. The returned slice is
-    /// `&[Polynomial<F, B>]` (not `&[ManuallyDrop<...>]`) — sound
-    /// because `ManuallyDrop<T>` is `#[repr(transparent)]` over `T`
-    /// and callers only get shared, read-only access (no moves or
-    /// drops through the slice).
-    pub(crate) fn as_slice(&self) -> &[Polynomial<F, B>] {
-        // SAFETY: ManuallyDrop<T> is #[repr(transparent)]; layout is
-        // identical to T. Shared borrow, no drops, no mutations.
-        #[allow(unsafe_code)]
-        unsafe {
-            std::slice::from_raw_parts(
-                self.polys.as_ptr() as *const Polynomial<F, B>,
-                self.polys.len(),
-            )
-        }
+    /// Borrow in the same concrete representation used for owned polynomials.
+    pub(crate) fn views(&self) -> Vec<PolynomialView<'_, F, B>> {
+        polynomial_views(&self.polys)
     }
 
     /// Number of polynomials held.
@@ -115,135 +120,221 @@ impl<F, B> MmappedPolys<F, B> {
 /// partition is too small for the working set — e.g. Android
 /// emulator `/data/local/tmp`). Falls back to the OS default when
 /// the env var is unset or empty.
-fn make_tempfile() -> io::Result<tempfile::NamedTempFile> {
-    let mut builder = tempfile::Builder::new();
-    builder.prefix("midnight-spill-");
+fn make_tempfile() -> io::Result<std::fs::File> {
     match std::env::var("MIDNIGHT_SPILL_DIR") {
-        Ok(dir) if !dir.is_empty() => builder.tempfile_in(dir),
-        _ => builder.tempfile(),
+        Ok(dir) if !dir.is_empty() => tempfile::tempfile_in(dir),
+        _ => tempfile::tempfile(),
     }
 }
 
-/// Stream each element of `polys` to a tempfile (raw field bytes,
-/// no encoding), mmap the file read-only, and return Polynomial
-/// views over the mapped pages.
+/// Ensure the spill has real backing store before a writable mapping can
+/// fault pages in. Merely extending the file can create a sparse file; on a
+/// full volume, writing that mapping may then terminate the process with
+/// SIGBUS instead of returning an `io::Error`.
+fn reserve_spill_file(file: &mut std::fs::File, total_bytes: usize) -> io::Result<()> {
+    let file_len = u64::try_from(total_bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "spill is too large"))?;
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        use std::os::fd::AsRawFd;
+
+        let allocation_len = libc::off_t::try_from(total_bytes).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "spill is too large for off_t")
+        })?;
+        // SAFETY: `file` owns a valid descriptor and the offset/length are
+        // checked representations. `posix_fallocate` does not access Rust
+        // memory and returns an errno value directly.
+        #[allow(unsafe_code)]
+        let status = unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, allocation_len) };
+        if status != 0 {
+            return Err(io::Error::from_raw_os_error(status));
+        }
+        file.set_len(file_len)?;
+        Ok(())
+    }
+
+    #[cfg(target_vendor = "apple")]
+    {
+        use std::os::fd::AsRawFd;
+
+        let allocation_len = libc::off_t::try_from(total_bytes).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "spill is too large for off_t")
+        })?;
+        let mut store = libc::fstore_t {
+            // Require the contiguous attempt to be all-or-nothing. APFS may
+            // otherwise report success after reserving only the largest
+            // contiguous extent, which is insufficient for SIGBUS safety.
+            fst_flags: libc::F_ALLOCATECONTIG | libc::F_ALLOCATEALL,
+            fst_posmode: libc::F_PEOFPOSMODE,
+            fst_offset: 0,
+            fst_length: allocation_len,
+            fst_bytesalloc: 0,
+        };
+        // Prefer one contiguous allocation, then accept any complete physical
+        // allocation. Both attempts are all-or-nothing.
+        // SAFETY: `store` is a valid writable `fstore_t` for the duration of
+        // both calls and `file` owns a valid descriptor.
+        #[allow(unsafe_code)]
+        let mut status = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PREALLOCATE, &mut store) };
+        if status == -1 {
+            store.fst_flags = libc::F_ALLOCATEALL;
+            #[allow(unsafe_code)]
+            {
+                status = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PREALLOCATE, &mut store) };
+            }
+        }
+        if status == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        if store.fst_bytesalloc < allocation_len {
+            return Err(io::Error::other(
+                "filesystem did not reserve the complete spill",
+            ));
+        }
+        file.set_len(file_len)?;
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+    {
+        // Portable, intentionally slower fallback: writing every block makes
+        // allocation failure recoverable before the mapping is created.
+        const ZERO_BLOCK: [u8; 1024 * 1024] = [0; 1024 * 1024];
+        file.set_len(0)?;
+        let mut remaining = total_bytes;
+        while remaining != 0 {
+            let n = remaining.min(ZERO_BLOCK.len());
+            file.write_all(&ZERO_BLOCK[..n])?;
+            remaining -= n;
+        }
+        file.flush()?;
+        Ok(())
+    }
+}
+
+/// Move each element of `polys` into a mutable file mapping, make the mapping
+/// read-only, and return typed views over it.
 ///
-/// All polynomials produced by the iterator MUST have
-/// `values.len() == n_per_poly`. The invariant lets the read-back
+/// The iterator MUST yield exactly `n_polys` values, each with
+/// `values.len() == n_per_poly`. These invariants let the read-back
 /// compute the i-th polynomial's offset as `i * n_per_poly` without
-/// per-element headers; it's `debug_assert!`-checked.
+/// per-element headers; both are checked in release builds.
 ///
 /// Peak transient heap stays at ~1 polynomial during the write — the
 /// iterator yields owned `Polynomial<F, B>` values and each is
-/// dropped immediately after its bytes hit the writer.
-///
-/// # Safety contract on `F`
-///
-/// `F` must be `Copy` and have a stable, plain-old-data
-/// byte-for-byte in-memory representation (no interior pointers,
-/// no padding holes that observably matter). This is satisfied by
-/// `midnight-curves` field elements, which are `#[repr(transparent)]`
-/// wrappers over `[u64; 4]`.
+/// dropped immediately after its elements are copied into the mapping.
+/// Constructing live values in the mapping avoids both allocator-forged
+/// `Vec`s and assumptions about padding or a stable serialized layout.
 ///
 /// # Errors
 ///
-/// Returns the underlying `io::Error` from tempfile creation, the
-/// write loop, the flush, or `Mmap::map`.
+/// Returns an `io::Error` for invalid sizes or from tempfile/mmap operations.
 pub(crate) fn spill_iter_to_disk<F, B, I>(
     polys: I,
+    n_polys: usize,
     n_per_poly: usize,
 ) -> io::Result<MmappedPolys<F, B>>
 where
+    F: Copy,
     I: IntoIterator<Item = Polynomial<F, B>>,
 {
-    use std::io::Write as _;
-
     let elem_size = std::mem::size_of::<F>();
+    if elem_size == 0 || n_per_poly == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "spill requires non-empty rows of non-zero-sized elements",
+        ));
+    }
+
+    let mut iter = polys.into_iter();
+    let total_elems = n_polys.checked_mul(n_per_poly).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "spill element count overflows")
+    })?;
+    let total_bytes = total_elems
+        .checked_mul(elem_size)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "spill byte count overflows"))?;
     let mut tmp = make_tempfile()?;
 
-    // Streaming write: drop each `p` before allocating the next.
-    {
-        let mut writer = std::io::BufWriter::new(&mut tmp);
-        for p in polys {
-            debug_assert_eq!(
-                p.values.len(),
-                n_per_poly,
-                "spill_iter_to_disk: polynomial size mismatch (got {}, expected n_per_poly = {})",
-                p.values.len(),
-                n_per_poly
-            );
-            // SAFETY: F is repr-stable plain-old-data per the
-            // module-level safety contract. We borrow the raw bytes
-            // of a live Vec<F> we own; the borrow ends before `p`
-            // drops at the end of this loop iteration.
-            #[allow(unsafe_code)]
-            let bytes = unsafe {
-                std::slice::from_raw_parts(
-                    p.values.as_ptr() as *const u8,
-                    p.values.len() * elem_size,
-                )
-            };
-            writer.write_all(bytes)?;
-            // `p` drops here, freeing the polynomial's heap storage
-            // before the next iteration's transient allocation.
-        }
-        writer.flush()?;
+    if total_bytes == 0 {
+        return Ok(MmappedPolys {
+            polys: Vec::new(),
+            mmap_bytes: 0,
+        });
     }
 
-    let (file, tmp_path) = tmp.into_parts();
-    // SAFETY: read-only mmap of a file we just wrote and exclusively
-    // own. No other process can be modifying it concurrently.
+    reserve_spill_file(&mut tmp, total_bytes)?;
+    // SAFETY: the file is exclusively owned and has exactly `total_bytes`.
     #[allow(unsafe_code)]
-    let mmap = unsafe { memmap2::Mmap::map(&file)? };
-    let mmap_arc = Arc::new(mmap);
-
-    // Build non-owning Polynomial views into the mmap region. The
-    // number of polynomials is recovered from the file size (the
-    // iterator is already exhausted at this point).
-    let total_bytes = mmap_arc.len();
-    debug_assert!(
-        n_per_poly == 0 || total_bytes % (n_per_poly * elem_size) == 0,
-        "spill_iter_to_disk: tempfile size {} not a multiple of {} × {} bytes",
-        total_bytes,
-        n_per_poly,
-        elem_size
-    );
-    let n_polys = if n_per_poly == 0 {
-        0
-    } else {
-        total_bytes / (n_per_poly * elem_size)
-    };
-
-    let mut polys_view = Vec::with_capacity(n_polys);
-    let base_ptr = mmap_arc.as_ptr() as *const F;
-    for i in 0..n_polys {
-        // SAFETY: the file holds exactly `n_polys` consecutive
-        // blocks of `n_per_poly × elem_size` bytes (verified by the
-        // debug_assert above). The pointer arithmetic stays inside
-        // the mmap region. The Vec is immediately wrapped in
-        // ManuallyDrop so its allocator-aware destructor never runs.
-        #[allow(unsafe_code)]
-        let ptr = unsafe { base_ptr.add(i * n_per_poly) as *mut F };
-        #[allow(unsafe_code)]
-        let values = unsafe { Vec::from_raw_parts(ptr, n_per_poly, n_per_poly) };
-        let poly = Polynomial::<F, B> {
-            values,
-            _marker: PhantomData,
-        };
-        polys_view.push(ManuallyDrop::new(poly));
+    let mut mmap = unsafe { memmap2::MmapOptions::new().len(total_bytes).map_mut(&tmp)? };
+    let base_ptr = mmap.as_mut_ptr() as *mut F;
+    if (base_ptr as usize) % std::mem::align_of::<F>() != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "spill mapping is misaligned for polynomial elements",
+        ));
     }
+
+    let mut written_polys = 0usize;
+    for (poly_index, poly) in iter.by_ref().enumerate() {
+        // The declared count is checked on both sides of the loop. Reject
+        // overproduction before pointer arithmetic and underproduction below.
+        if poly_index >= n_polys {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "spill iterator yielded more polynomials than promised",
+            ));
+        }
+        if poly.values.len() != n_per_poly {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "spill_iter_to_disk: polynomial size mismatch (got {}, expected {})",
+                    poly.values.len(),
+                    n_per_poly
+                ),
+            ));
+        }
+        let start = poly_index * n_per_poly;
+        for (index, value) in poly.values.iter().copied().enumerate() {
+            // SAFETY: the checked declared count fixed the mapping length; both
+            // indices are checked above. `F: Copy` has no destructor, and this
+            // writes a live value instead of reinterpreting serialized bytes.
+            #[allow(unsafe_code)]
+            unsafe {
+                base_ptr.add(start + index).write(value);
+            }
+        }
+        written_polys += 1;
+    }
+    if written_polys != n_polys {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "spill iterator yielded fewer polynomials than promised",
+        ));
+    }
+
+    mmap.flush()?;
+    let mmap_arc = Arc::new(mmap.make_read_only()?);
+    let polys_view = (0..n_polys)
+        .map(|index| MappedPolynomial {
+            mmap: Arc::clone(&mmap_arc),
+            offset: index * n_per_poly * elem_size,
+            len: n_per_poly,
+            _marker: PhantomData,
+        })
+        .collect();
 
     Ok(MmappedPolys {
         polys: polys_view,
-        _mmap: mmap_arc,
-        _tmp_path: tmp_path,
+        mmap_bytes: total_bytes,
     })
 }
 
 /// Convenience: spill a `Vec<Polynomial<F, B>>` (consuming it).
 ///
-/// Equivalent to `spill_iter_to_disk(polys.into_iter(), n_per_poly)`
-/// but the `Vec` is `drain(..)`'d in place so the Vec spine itself
+/// Equivalent to `spill_iter_to_disk(polys.into_iter(), polys.len(),
+/// n_per_poly)` but the `Vec` is `drain(..)`'d in place so the Vec spine itself
 /// can be freed mid-loop on long batches.
 // P3 consumers (ProvingKey integration) call this; suppress the
 // dead-code warning while only the P1 surface ships.
@@ -251,8 +342,12 @@ where
 pub(crate) fn spill_vec_to_disk<F, B>(
     mut polys: Vec<Polynomial<F, B>>,
     n_per_poly: usize,
-) -> io::Result<MmappedPolys<F, B>> {
-    spill_iter_to_disk(polys.drain(..), n_per_poly)
+) -> io::Result<MmappedPolys<F, B>>
+where
+    F: Copy,
+{
+    let n_polys = polys.len();
+    spill_iter_to_disk(polys.drain(..), n_polys, n_per_poly)
 }
 
 /// Spill the result of applying `transform` to each input polynomial.
@@ -269,24 +364,32 @@ pub(crate) fn spill_vec_to_disk<F, B>(
 ///
 /// Inputs are taken by shared reference so the caller retains the
 /// originals (e.g. `pk.fixed_polys`, `pk.permutation.polys`) — the
-/// transform clones internally as needed.
-pub(crate) fn spill_with_transform<F, In, Out, T>(
-    inputs: &[Polynomial<F, In>],
-    n_per_out_poly: usize,
-    transform: T,
+/// transform materialises only its current output. The first result supplies
+/// the mapped row width and is reused rather than transformed twice.
+pub(crate) fn spill_with_transform<F, In, Out, P, T>(
+    inputs: &[P],
+    mut transform: T,
 ) -> io::Result<MmappedPolys<F, Out>>
 where
-    T: FnMut(&Polynomial<F, In>) -> Polynomial<F, Out>,
+    F: Copy,
+    P: PolynomialRead<F, Basis = In>,
+    T: for<'a> FnMut(PolynomialView<'a, F, In>) -> Polynomial<F, Out>,
 {
-    spill_iter_to_disk(inputs.iter().map(transform), n_per_out_poly)
+    let (first, rest) = inputs.split_first().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cannot infer the size of an empty spill",
+        )
+    })?;
+    let first = transform(PolynomialView::new(first.values()));
+    let n_per_out_poly = first.values.len();
+    let remaining = rest.iter().map(|input| transform(PolynomialView::new(input.values())));
+    spill_iter_to_disk(
+        std::iter::once(first).chain(remaining),
+        inputs.len(),
+        n_per_out_poly,
+    )
 }
-
-// Integration tests against real `Polynomial<Fr, _>` values land in
-// P3 once the type is wired into `ProvingKey::read`. The vendor
-// crate's `dev-deps` pipeline is currently unbuildable in this fork,
-// so unit tests with synthetic field types can't run here either —
-// the consumer-side tests (smoke-test `proof_bytes` equality at
-// k=10..18 with/without S5) are the actual coverage.
 
 #[cfg(test)]
 mod test {
@@ -307,14 +410,15 @@ mod test {
         let src = vec![poly(&[1, 2, 3, 4]), poly(&[5, 6, 7, 8])];
         let expected: Vec<Vec<Fp>> = src.iter().map(|p| p.values.clone()).collect();
 
-        let spilled = spill_iter_to_disk(src, 4).unwrap();
-        let got = spilled.as_slice();
+        let spilled = spill_iter_to_disk(src, 2, 4).unwrap();
+        let got = spilled.views();
 
         assert_eq!(got.len(), 2);
         for (i, p) in got.iter().enumerate() {
-            assert_eq!(p.values.len(), 4, "poly {i} length");
+            assert_eq!(p.len(), 4, "poly {i} length");
             assert_eq!(
-                p.values, expected[i],
+                &p[..],
+                &expected[i],
                 "poly {i} values survived the round trip"
             );
         }
@@ -322,21 +426,20 @@ mod test {
 
     #[test]
     fn spill_handles_the_empty_batch() {
-        let spilled: MmappedPolys<Fp, LagrangeCoeff> = spill_iter_to_disk(Vec::new(), 4).unwrap();
-        assert!(spilled.as_slice().is_empty());
+        let spilled: MmappedPolys<Fp, LagrangeCoeff> =
+            spill_iter_to_disk(Vec::new(), 0, 4).unwrap();
+        assert!(spilled.views().is_empty());
         // Dropping an empty mapping must not fault either.
         drop(spilled);
     }
 
     #[test]
     fn dropping_does_not_free_mmap_pages() {
-        // The module's central claim: the Polynomial views are ManuallyDrop, so
-        // the global allocator never sees a pointer it did not hand out. If that
-        // is wrong this aborts rather than failing, which is exactly why it is
-        // worth asserting rather than assuming.
+        // The descriptors own only Arcs, offsets, and lengths, so dropping them
+        // must never send a mapped pointer to the global allocator.
         for _ in 0..8 {
-            let spilled = spill_iter_to_disk(vec![poly(&[9, 9, 9, 9])], 4).unwrap();
-            assert_eq!(spilled.as_slice()[0].values[0], Fp::from(9u64));
+            let spilled = spill_iter_to_disk(vec![poly(&[9, 9, 9, 9])], 1, 4).unwrap();
+            assert_eq!(spilled.views()[0][0], Fp::from(9u64));
             drop(spilled);
         }
     }
@@ -347,16 +450,37 @@ mod test {
         // mapping must not alias their freed heap.
         let spilled = {
             let src = vec![poly(&[11, 22, 33, 44])];
-            spill_iter_to_disk(src, 4).unwrap()
+            spill_iter_to_disk(src, 1, 4).unwrap()
         };
         assert_eq!(
-            spilled.as_slice()[0].values,
+            &spilled.views()[0][..],
             vec![
                 Fp::from(11u64),
                 Fp::from(22u64),
                 Fp::from(33u64),
                 Fp::from(44u64)
             ]
+        );
+    }
+
+    #[test]
+    fn rejects_a_mismatched_polynomial_length() {
+        let error = spill_iter_to_disk(vec![poly(&[1, 2, 3])], 1, 4).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn rejects_a_wrong_declared_count_before_exposing_uninitialised_memory() {
+        let too_many = vec![poly(&[1]), poly(&[2])];
+        assert_eq!(
+            spill_iter_to_disk(too_many, 1, 1).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+
+        let too_few = vec![poly(&[1])];
+        assert_eq!(
+            spill_iter_to_disk(too_few, 2, 1).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
         );
     }
 }

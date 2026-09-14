@@ -47,6 +47,10 @@ memmap2 = { version = "0.9", optional = true }
 # extended polynomials never coreside in heap — the unlock for
 # k≥20 on a 6 GiB-limited mobile device. Behind `disk-spill`.
 tempfile = { version = "3", optional = true }
+# Reserve backing-store blocks before a writable spill mapping is touched.
+# Without this, `set_len` may create a sparse file and ENOSPC can surface as
+# SIGBUS during a page fault instead of a recoverable `io::Error`.
+libc = { version = "0.2", optional = true }
 rand_core = { workspace = true, features = ["getrandom"] }
 tracing = { workspace = true }
 blake2b_simd = { workspace = true }
@@ -101,7 +105,7 @@ mmap = ["dep:memmap2"]
 
 # Stream polynomials to a tempfile and map them back. Needs `mmap` to read
 # what it wrote, so it enables it rather than duplicating the capability.
-disk-spill = ["mmap", "dep:tempfile"]
+disk-spill = ["mmap", "dep:tempfile", "dep:libc"]
 
 # This feature truncates challenges to half the size of the scalar field.
 truncated-challenges = []
