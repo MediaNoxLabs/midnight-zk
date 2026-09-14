@@ -443,12 +443,34 @@ where
     /// produced and consumed without committing to a specific
     /// `SerdeFormat`.
     ///
-    /// # Safety
+    /// # Trust boundary
     ///
-    /// The caller is trusting the file producer to have used the same
-    /// `E::G1` memory layout. The header carries `point_size` so
-    /// mismatched producer / consumer fail-fast with `InvalidData`
-    /// rather than producing UB at MSM time.
+    /// **This file is a local cache this library produced. It is not an
+    /// interchange format.** Do not fetch it over a network, sync it between
+    /// devices, accept it from another party, or place it anywhere a less
+    /// privileged process can write. Treat it exactly as you would treat the
+    /// process's own heap.
+    ///
+    /// What the header check buys, precisely:
+    ///
+    /// - the magic, `point_size`, every offset and count, and the alignment of
+    ///   each block are validated before anything is mapped, so a truncated,
+    ///   mismatched or out-of-range file fails with `InvalidData` rather than
+    ///   producing UB at MSM time;
+    /// - the *contents* are not validated. Bytes inside a well-formed block are
+    ///   reinterpreted as `E::G1` without checking that they encode points on
+    ///   the curve.
+    ///
+    /// So a hostile file with a valid header yields **wrong proofs, not memory
+    /// corruption** — and that holds only because every bit pattern is a valid
+    /// inhabitant of `E::G1`'s field-element representation. A curve type with
+    /// niches or validity invariants would make the same file a soundness
+    /// problem, which is why `point_size` is checked and why this is stated
+    /// rather than left implicit.
+    ///
+    /// The caller is also trusting the producer to have used the same `E::G1`
+    /// memory layout; `point_size` in the header is what makes a mismatched
+    /// producer and consumer fail fast.
     // Confined `unsafe`: mmap-region pointer arithmetic +
     // `from_raw_parts`-style slice construction. The invariants are
     // documented inline; see also `BasesStorage::mapped` SAFETY notes.
