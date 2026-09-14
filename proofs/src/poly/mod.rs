@@ -19,6 +19,7 @@ use crate::utils::{arithmetic::parallelize, SerdeFormat};
 
 mod domain;
 mod query;
+mod view;
 
 /// KZG commitment scheme
 pub mod kzg;
@@ -27,6 +28,7 @@ pub mod commitment;
 
 pub use domain::*;
 pub use query::{CommitmentLabel, ProverQuery, VerifierQuery};
+pub(crate) use view::{polynomial_inner_product, polynomial_views, PolynomialRead, PolynomialView};
 
 use crate::utils::{helpers::read_f, rational::Rational};
 
@@ -272,15 +274,6 @@ impl<F: PrimeField + SerdeObject, B> Polynomial<F, B> {
                 values,
                 _marker: PhantomData,
             })
-    }
-
-    /// Writes polynomial to buffer using `SerdePrimeField::write`.
-    pub(crate) fn write<W: io::Write>(&self, writer: &mut W) -> io::Result<()> {
-        writer.write_all(&(self.values.len() as u32).to_be_bytes())?;
-        for value in self.values.iter() {
-            value.write_raw(writer)?;
-        }
-        Ok(())
     }
 }
 

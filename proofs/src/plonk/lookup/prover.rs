@@ -12,7 +12,7 @@ use crate::{
     plonk::evaluation::evaluate,
     poly::{
         commitment::PolynomialCommitmentScheme, Coeff, EvaluationDomain, LagrangeCoeff, Polynomial,
-        ProverQuery, Rotation,
+        PolynomialView, ProverQuery, Rotation,
     },
     transcript::{Hashable, Transcript},
     utils::arithmetic::{eval_polynomial, parallelize},
@@ -66,9 +66,9 @@ impl<F: WithSmallOrderMulGroup<3> + Ord + Hash> Argument<F> {
         params: &'params CS::Parameters,
         domain: &EvaluationDomain<F>,
         theta: F,
-        advice_values: &'a [Polynomial<F, LagrangeCoeff>],
-        fixed_values: &'a [Polynomial<F, LagrangeCoeff>],
-        instance_values: &'a [Polynomial<F, LagrangeCoeff>],
+        advice_values: &'a [PolynomialView<'a, F, LagrangeCoeff>],
+        fixed_values: &'a [PolynomialView<'a, F, LagrangeCoeff>],
+        instance_values: &'a [PolynomialView<'a, F, LagrangeCoeff>],
         challenges: &'a [F],
         rng: &mut impl RngCore,
         transcript: &mut T,
@@ -340,30 +340,27 @@ impl<F: WithSmallOrderMulGroup<3>> Evaluated<F> {
 
         iter::empty()
             // Open lookup product commitments at x
-            .chain(Some(ProverQuery {
-                point: x,
-                poly: &self.constructed.product_poly,
-            }))
+            .chain(Some(ProverQuery::new(x, &self.constructed.product_poly)))
             // Open lookup input commitments at x
-            .chain(Some(ProverQuery {
-                point: x,
-                poly: &self.constructed.permuted_input_poly,
-            }))
+            .chain(Some(ProverQuery::new(
+                x,
+                &self.constructed.permuted_input_poly,
+            )))
             // Open lookup table commitments at x
-            .chain(Some(ProverQuery {
-                point: x,
-                poly: &self.constructed.permuted_table_poly,
-            }))
+            .chain(Some(ProverQuery::new(
+                x,
+                &self.constructed.permuted_table_poly,
+            )))
             // Open lookup input commitments at x_inv
-            .chain(Some(ProverQuery {
-                point: x_inv,
-                poly: &self.constructed.permuted_input_poly,
-            }))
+            .chain(Some(ProverQuery::new(
+                x_inv,
+                &self.constructed.permuted_input_poly,
+            )))
             // Open lookup product commitments at x_next
-            .chain(Some(ProverQuery {
-                point: x_next,
-                poly: &self.constructed.product_poly,
-            }))
+            .chain(Some(ProverQuery::new(
+                x_next,
+                &self.constructed.product_poly,
+            )))
     }
 }
 
