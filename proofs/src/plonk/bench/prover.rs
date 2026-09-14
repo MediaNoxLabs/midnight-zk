@@ -575,13 +575,26 @@ where
 /// the same path while deserializing a key with `MIDNIGHT_SPILL_PK=1`, whereas
 /// a benchmark already owns a freshly generated key and needs to prepare it
 /// without including a serialize/read cycle in the measurement.
+///
+/// # Why this consumes the key
+///
+/// The spill's whole memory benefit is that each polynomial is freed as soon as
+/// it has been written, so a failure partway through has already dropped the
+/// ones before it. There is no state to roll back to.
+///
+/// Taking `pk` by value and returning it only on success makes that
+/// unobservable: a failed spill yields an `Err` and no key, rather than an
+/// `Err` beside a key whose fixed polynomials are silently empty. The earlier
+/// `&mut` signature left exactly that — and the emptied field reads back as an
+/// empty slice, so the next proof would be built from nothing.
 #[cfg(feature = "disk-spill")]
-pub fn spill_proving_key<F, CS>(pk: &mut ProvingKey<F, CS>) -> std::io::Result<()>
+pub fn spill_proving_key<F, CS>(mut pk: ProvingKey<F, CS>) -> std::io::Result<ProvingKey<F, CS>>
 where
     F: PrimeField,
     CS: PolynomialCommitmentScheme<F>,
 {
-    pk.spill_all_to_mmap()
+    pk.spill_all_to_mmap()?;
+    Ok(pk)
 }
 
 /// Benchmarked version of proof creation that measures each internal step.

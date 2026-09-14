@@ -475,6 +475,36 @@ impl<F: PrimeField, CS: PolynomialCommitmentScheme<F>> ProvingKey<F, CS> {
         self.spill_fixed_polys_to_mmap()?;
         self.spill_fixed_values_to_mmap()?;
         self.spill_permutation_polys_to_mmap()?;
+
+        // Drop the cached extended-domain cosets.
+        //
+        // Without this the spill mostly does not work. `ProvingKey::read`
+        // eagerly builds `fixed_cosets` and `permutation::ProvingKey::read`
+        // builds its own — each `4n` per column, and together by far the
+        // largest allocation in a loaded key. Spilling the *polynomials*
+        // while leaving those in place moves the smaller half and reports
+        // success.
+        //
+        // Worse, the prover prefers them when present
+        // (`prover.rs`: `if !pk.fixed_cosets.is_empty()`), so leaving them
+        // also short-circuits the coset spill: a key loaded with both knobs
+        // enabled would keep every coset on the heap and never reach
+        // `build_cosets`.
+        //
+        // They are derived data — `coeff_to_extended` of the polynomials we
+        // just spilled — so dropping them costs a rebuild at prove time,
+        // which is precisely the trade the spill exists to make. Done last,
+        // after the spills have succeeded, so a failure does not discard
+        // them for nothing.
+        //
+        // Not covered by a unit test: constructing a `ProvingKey` requires a
+        // full keygen, which nothing at this level can do cheaply. The
+        // regression this guards against is "someone adds a third cached-coset
+        // collection and does not clear it here", and the honest place to catch
+        // that is an end-to-end assertion on a real key — tracked rather than
+        // faked with a test that would only assert these two fields exist.
+        self.fixed_cosets = Vec::new();
+        self.permutation.cosets = Vec::new();
         Ok(())
     }
 }

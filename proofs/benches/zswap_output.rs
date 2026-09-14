@@ -325,16 +325,17 @@ fn bench_zswap_output(c: &mut Criterion) {
     let circuit = MidnightCircuit::from_relation(&ZSwapOutputCircuit, Some(k));
     let vk = keygen_vk_with_k::<_, KZGCommitmentScheme<Bls12>, _>(&srs, &circuit, k)
         .expect("Failed to generate VK");
-    #[cfg_attr(not(feature = "disk-spill"), allow(unused_mut))]
-    let mut pk = keygen_pk(vk, &circuit).expect("Failed to generate PK");
+    let pk = keygen_pk(vk, &circuit).expect("Failed to generate PK");
     let (instance, circuit) = sample_zswap_inputs(k);
     let (memory_profile, spill_pk) = benchmark_memory_profile(k);
     eprintln!("ZSwap benchmark memory profile: {memory_profile}");
     #[cfg(feature = "disk-spill")]
-    if spill_pk {
-        midnight_proofs::plonk::bench::prover::spill_proving_key(&mut pk)
-            .expect("Failed to prepare mmap-backed proving key");
-    }
+    let pk = if spill_pk {
+        midnight_proofs::plonk::bench::prover::spill_proving_key(pk)
+            .expect("Failed to prepare mmap-backed proving key")
+    } else {
+        pk
+    };
     #[cfg(not(feature = "disk-spill"))]
     let _ = spill_pk;
 

@@ -479,6 +479,12 @@ where
     pub fn read_mmap_arc(mmap: std::sync::Arc<memmap2::Mmap>) -> io::Result<Self>
     where
         E::G2: ProcessedSerdeObject,
+        // Reinterpreting file bytes as `E::G1` is only defined when every bit
+        // pattern inhabits the type. `ProcessedSerdeObject` does not say that —
+        // it is about serialisation — so a curve with a niche would make a
+        // structurally valid file undefined behaviour on first dereference.
+        // `PlainBytes` is sealed, so only curves this crate has checked qualify.
+        E::G1: crate::poly::kzg::bases::PlainBytes,
     {
         const HEADER_LEN: usize = 96;
         const MAGIC: &[u8; 8] = b"MDNGHTV1";
@@ -603,6 +609,11 @@ where
     where
         E::G2: ProcessedSerdeObject,
         E::G1: ProcessedSerdeObject,
+        // Reading `&[E::G1]` back as bytes is only defined when the type has no
+        // padding: padding bytes are uninitialised, and handing them to
+        // `write_all` is undefined behaviour that can leak adjacent memory.
+        // Same sealed trait, same reason.
+        E::G1: crate::poly::kzg::bases::PlainBytes,
     {
         const HEADER_LEN: usize = 96;
         const G_OFFSET: u64 = 128; // 128-byte alignment for SIMD friendliness

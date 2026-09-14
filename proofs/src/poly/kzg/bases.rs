@@ -57,6 +57,39 @@ use std::sync::Arc;
 #[cfg(feature = "mmap")]
 use memmap2::Mmap;
 
+/// Types this crate is willing to read and write as plain bytes.
+///
+/// The mmap companion format reinterprets file bytes as `C` and reinterprets
+/// `&[C]` as bytes. Both directions require more than size and alignment:
+///
+/// - **Every bit pattern must be a valid `C`.** A type with a niche, an enum
+///   discriminant, a `NonZero`, or any validity invariant makes the read
+///   direction undefined behaviour for a file it did not produce — and the
+///   header check cannot detect it, because the bytes are structurally fine.
+/// - **`C` must have no padding.** Padding bytes are uninitialised; handing a
+///   slice containing them to `write_all` is undefined behaviour and can leak
+///   adjacent memory.
+///
+/// `ProcessedSerdeObject` guarantees neither — it is about serialisation, not
+/// layout — so bounding on it was not enough. This trait is **sealed**, so only
+/// this crate can add implementors, and it does so only for types whose layout
+/// it has checked.
+///
+/// This is the same contract `bytemuck::Pod` expresses. It is spelled out here
+/// rather than taking the dependency, and because the sealing is the point: a
+/// downstream `Engine` must not be able to opt its own curve in.
+pub trait PlainBytes: sealed::Sealed + Copy + 'static {}
+
+mod sealed {
+    /// Prevents implementation outside this crate.
+    pub trait Sealed {}
+}
+
+// BLS12-381 G1 in projective form: three field elements, each a `[u64; 6]`
+// wrapper with no padding and no niche, so every bit pattern is inhabited.
+impl sealed::Sealed for midnight_curves::G1Projective {}
+impl PlainBytes for midnight_curves::G1Projective {}
+
 /// Storage backing for an SRS basis vector.
 pub(crate) enum BasesStorage<C: 'static> {
     /// Heap-allocated. The default for `unsafe_setup`, the eager
