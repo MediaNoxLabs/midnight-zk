@@ -329,15 +329,71 @@ fn bench_zswap_output(c: &mut Criterion) {
     let (instance, circuit) = sample_zswap_inputs(k);
     let (memory_profile, spill_pk) = benchmark_memory_profile(k);
     eprintln!("ZSwap benchmark memory profile: {memory_profile}");
-    #[cfg(feature = "disk-spill")]
-    let pk = if spill_pk {
-        midnight_proofs::plonk::bench::prover::spill_proving_key(pk)
-            .expect("Failed to prepare mmap-backed proving key")
-    } else {
-        pk
+
+    // Which path prepares the proving key.
+    //
+    // `keygen` is what this benchmark has always measured: a freshly generated
+    // key, spilled in place. `deserialise` is what a device actually does —
+    // serialise the key and load it back through `ProvingKey::read`, where the
+    // spill policy is applied on load. The two were assumed equivalent and are
+    // not: `read` eagerly rebuilds every extended-domain coset before the
+    // policy is consulted, so its load-time peak is a different number from
+    // the keygen path's. Measuring only the keygen path is how that stayed
+    // hidden.
+    let key_path = std::env::var("MIDNIGHT_BENCH_KEY_PATH").unwrap_or_else(|_| "keygen".into());
+    eprintln!("ZSwap benchmark key path: {key_path}");
+    let pk = match key_path.as_str() {
+        "keygen" => {
+            #[cfg(feature = "disk-spill")]
+            let pk = if spill_pk {
+                midnight_proofs::plonk::bench::prover::spill_proving_key(pk)
+                    .expect("Failed to prepare mmap-backed proving key")
+            } else {
+                pk
+            };
+            #[cfg(not(feature = "disk-spill"))]
+            let _ = spill_pk;
+            pk
+        }
+        "deserialise" => {
+            // `read` applies `ProverConfig::process().map_prover_key` itself, so
+            // the spill (or not) is decided by the same variables as `keygen`.
+            let format = midnight_proofs::utils::SerdeFormat::RawBytesUnchecked;
+            let bytes = pk.to_bytes(format);
+            drop(pk);
+            eprintln!("ZSwap benchmark serialised PK: {} MiB", bytes.len() >> 20);
+            // Stop before reading back. The keygen that produced `bytes` ran in
+            // this same process, and freed memory the allocator retains still
+            // counts as footprint — so without this control, the deserialise
+            // path's peak cannot be separated from keygen's residue. The
+            // difference between this exit and a full `read` is what `read`
+            // adds; if there is barely any, the "2×" was never `read`'s.
+            if flag_enabled("MIDNIGHT_BENCH_STOP_BEFORE_READ") {
+                eprintln!("ZSwap benchmark: stopping before ProvingKey::read as requested");
+                std::process::exit(0);
+            }
+            // `circuit-params` is unified in by a dependency, so `read` needs the
+            // circuit's params; take them from the live circuit rather than
+            // rebuilding them by hand.
+            let params = midnight_proofs::plonk::Circuit::<F>::params(&circuit);
+            midnight_proofs::plonk::ProvingKey::<F, KZGCommitmentScheme<Bls12>>::from_bytes::<
+                MidnightCircuit<'static, ZSwapOutputCircuit>,
+            >(&bytes, format, params)
+            .expect("Failed to deserialise proving key")
+        }
+        other => panic!("MIDNIGHT_BENCH_KEY_PATH must be keygen|deserialise, got {other:?}"),
     };
-    #[cfg(not(feature = "disk-spill"))]
-    let _ = spill_pk;
+
+    // Stop here when asked. `/usr/bin/time -l` reports the process-wide peak,
+    // and keygen runs before `read` in this same process, so a full proof run
+    // cannot say which phase set the peak. Exiting right after key preparation
+    // makes the peak *of preparing the key* the number reported — and the
+    // difference between the `keygen` and `deserialise` paths is then exactly
+    // what `ProvingKey::read` adds on top of generating the same key.
+    if flag_enabled("MIDNIGHT_BENCH_STOP_AFTER_KEY") {
+        eprintln!("ZSwap benchmark: stopping after key preparation as requested");
+        std::process::exit(0);
+    }
 
     // This is intentionally a one-shot observation rather than a Criterion
     // distribution. It starts after the SRS and proving key are ready, so it
