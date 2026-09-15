@@ -98,14 +98,16 @@ impl<F, B> MmappedPolys<F, B> {
     }
 }
 
-/// Resolve the tempfile directory used by spills.
+/// Open the tempfile a spill writes into.
 ///
-/// Honours `MIDNIGHT_SPILL_DIR` (useful when the default `TMPDIR`
-/// partition is too small for the working set — e.g. Android
-/// emulator `/data/local/tmp`). Falls back to the OS default when
-/// the env var is unset or empty.
-fn make_tempfile() -> io::Result<std::fs::File> {
-    match crate::config::ProverConfig::process().spill_dir.as_ref() {
+/// `spill_dir` is the policy's
+/// [`spill_dir`](crate::config::ProverConfig::spill_dir) — worth setting where
+/// the default `TMPDIR` partition is too small for the working set, e.g. an
+/// Android emulator's `/data/local/tmp`. `None` is the OS default. The
+/// directory arrives as a parameter rather than being read from process state
+/// so that two proofs in one process can spill to different volumes.
+fn make_tempfile(spill_dir: Option<&std::path::Path>) -> io::Result<std::fs::File> {
+    match spill_dir {
         Some(dir) => tempfile::tempfile_in(dir),
         None => tempfile::tempfile(),
     }
@@ -215,6 +217,7 @@ fn reserve_spill_file(file: &mut std::fs::File, total_bytes: usize) -> io::Resul
 ///
 /// Returns an `io::Error` for invalid sizes or from tempfile/mmap operations.
 pub(crate) fn spill_iter_to_disk<F, B, I>(
+    spill_dir: Option<&std::path::Path>,
     polys: I,
     n_polys: usize,
     n_per_poly: usize,
@@ -238,7 +241,7 @@ where
     let total_bytes = total_elems
         .checked_mul(elem_size)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "spill byte count overflows"))?;
-    let mut tmp = make_tempfile()?;
+    let mut tmp = make_tempfile(spill_dir)?;
 
     if total_bytes == 0 {
         return Ok(MmappedPolys {
@@ -322,6 +325,7 @@ where
 /// can be freed mid-loop on long batches.
 // Proving-key integration consumes this helper.
 pub(crate) fn spill_vec_to_disk<F, B>(
+    spill_dir: Option<&std::path::Path>,
     mut polys: Vec<Polynomial<F, B>>,
     n_per_poly: usize,
 ) -> io::Result<MmappedPolys<F, B>>
@@ -329,7 +333,7 @@ where
     F: Copy,
 {
     let n_polys = polys.len();
-    spill_iter_to_disk(polys.drain(..), n_polys, n_per_poly)
+    spill_iter_to_disk(spill_dir, polys.drain(..), n_polys, n_per_poly)
 }
 
 /// Spill the result of applying `transform` to each input polynomial.
@@ -349,6 +353,7 @@ where
 /// transform materialises only its current output. The first result supplies
 /// the mapped row width and is reused rather than transformed twice.
 pub(crate) fn spill_with_transform<F, In, Out, P, T>(
+    spill_dir: Option<&std::path::Path>,
     inputs: &[P],
     mut transform: T,
 ) -> io::Result<MmappedPolys<F, Out>>
@@ -367,6 +372,7 @@ where
     let n_per_out_poly = first.values.len();
     let remaining = rest.iter().map(|input| transform(PolynomialView::new(input.values())));
     spill_iter_to_disk(
+        spill_dir,
         std::iter::once(first).chain(remaining),
         inputs.len(),
         n_per_out_poly,
@@ -392,7 +398,7 @@ mod test {
         let src = vec![poly(&[1, 2, 3, 4]), poly(&[5, 6, 7, 8])];
         let expected: Vec<Vec<Fp>> = src.iter().map(|p| p.values.clone()).collect();
 
-        let spilled = spill_iter_to_disk(src, 2, 4).unwrap();
+        let spilled = spill_iter_to_disk(None, src, 2, 4).unwrap();
         let got = spilled.views();
 
         assert_eq!(got.len(), 2);
@@ -409,7 +415,7 @@ mod test {
     #[test]
     fn spill_handles_the_empty_batch() {
         let spilled: MmappedPolys<Fp, LagrangeCoeff> =
-            spill_iter_to_disk(Vec::new(), 0, 4).unwrap();
+            spill_iter_to_disk(None, Vec::new(), 0, 4).unwrap();
         assert!(spilled.views().is_empty());
         // Dropping an empty mapping must not fault either.
         drop(spilled);
@@ -420,7 +426,7 @@ mod test {
         // The descriptors own only Arcs, offsets, and lengths, so dropping them
         // must never send a mapped pointer to the global allocator.
         for _ in 0..8 {
-            let spilled = spill_iter_to_disk(vec![poly(&[9, 9, 9, 9])], 1, 4).unwrap();
+            let spilled = spill_iter_to_disk(None, vec![poly(&[9, 9, 9, 9])], 1, 4).unwrap();
             assert_eq!(spilled.views()[0][0], Fp::from(9u64));
             drop(spilled);
         }
@@ -432,7 +438,7 @@ mod test {
         // mapping must not alias their freed heap.
         let spilled = {
             let src = vec![poly(&[11, 22, 33, 44])];
-            spill_iter_to_disk(src, 1, 4).unwrap()
+            spill_iter_to_disk(None, src, 1, 4).unwrap()
         };
         assert_eq!(
             &spilled.views()[0][..],
@@ -447,7 +453,7 @@ mod test {
 
     #[test]
     fn rejects_a_mismatched_polynomial_length() {
-        let error = spill_iter_to_disk(vec![poly(&[1, 2, 3])], 1, 4).unwrap_err();
+        let error = spill_iter_to_disk(None, vec![poly(&[1, 2, 3])], 1, 4).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
@@ -455,13 +461,13 @@ mod test {
     fn rejects_a_wrong_declared_count_before_exposing_uninitialised_memory() {
         let too_many = vec![poly(&[1]), poly(&[2])];
         assert_eq!(
-            spill_iter_to_disk(too_many, 1, 1).unwrap_err().kind(),
+            spill_iter_to_disk(None, too_many, 1, 1).unwrap_err().kind(),
             io::ErrorKind::InvalidInput
         );
 
         let too_few = vec![poly(&[1])];
         assert_eq!(
-            spill_iter_to_disk(too_few, 2, 1).unwrap_err().kind(),
+            spill_iter_to_disk(None, too_few, 2, 1).unwrap_err().kind(),
             io::ErrorKind::InvalidInput
         );
     }

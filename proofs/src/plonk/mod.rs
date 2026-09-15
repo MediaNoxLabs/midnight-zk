@@ -436,7 +436,10 @@ impl<F: PrimeField, CS: PolynomialCommitmentScheme<F>> ProvingKey<F, CS> {
     /// See [`Self::spill_all_to_mmap`] for a one-shot variant that
     /// also handles `fixed_values` and `permutation.polys`.
     #[cfg(feature = "disk-spill")]
-    pub(crate) fn spill_fixed_polys_to_mmap(&mut self) -> std::io::Result<()> {
+    pub(crate) fn spill_fixed_polys_to_mmap(
+        &mut self,
+        config: &crate::config::ProverConfig,
+    ) -> std::io::Result<()> {
         if self.fixed_polys_mmap.is_some() {
             return Ok(());
         }
@@ -445,7 +448,7 @@ impl<F: PrimeField, CS: PolynomialCommitmentScheme<F>> ProvingKey<F, CS> {
         }
         let n_per_poly = self.fixed_polys[0].values.len();
         let polys = std::mem::take(&mut self.fixed_polys);
-        let mm = mmap_pk::spill_vec_to_disk(polys, n_per_poly)?;
+        let mm = mmap_pk::spill_vec_to_disk(config.spill_dir.as_deref(), polys, n_per_poly)?;
         self.fixed_polys_mmap = Some(std::sync::Arc::new(mm));
         Ok(())
     }
@@ -453,7 +456,10 @@ impl<F: PrimeField, CS: PolynomialCommitmentScheme<F>> ProvingKey<F, CS> {
     /// Move `fixed_values` (LagrangeCoeff basis) into
     /// mmap-backed storage. Mirrors `spill_fixed_polys_to_mmap`.
     #[cfg(feature = "disk-spill")]
-    pub(crate) fn spill_fixed_values_to_mmap(&mut self) -> std::io::Result<()> {
+    pub(crate) fn spill_fixed_values_to_mmap(
+        &mut self,
+        config: &crate::config::ProverConfig,
+    ) -> std::io::Result<()> {
         if self.fixed_values_mmap.is_some() {
             return Ok(());
         }
@@ -462,7 +468,7 @@ impl<F: PrimeField, CS: PolynomialCommitmentScheme<F>> ProvingKey<F, CS> {
         }
         let n_per_poly = self.fixed_values[0].values.len();
         let polys = std::mem::take(&mut self.fixed_values);
-        let mm = mmap_pk::spill_vec_to_disk(polys, n_per_poly)?;
+        let mm = mmap_pk::spill_vec_to_disk(config.spill_dir.as_deref(), polys, n_per_poly)?;
         self.fixed_values_mmap = Some(std::sync::Arc::new(mm));
         Ok(())
     }
@@ -471,7 +477,10 @@ impl<F: PrimeField, CS: PolynomialCommitmentScheme<F>> ProvingKey<F, CS> {
     /// mmap-backed storage. Sidecar lives at the top-level PK so
     /// `permutation::ProvingKey` stays clone-safe and small.
     #[cfg(feature = "disk-spill")]
-    pub(crate) fn spill_permutation_polys_to_mmap(&mut self) -> std::io::Result<()> {
+    pub(crate) fn spill_permutation_polys_to_mmap(
+        &mut self,
+        config: &crate::config::ProverConfig,
+    ) -> std::io::Result<()> {
         if self.permutation_polys_mmap.is_some() {
             return Ok(());
         }
@@ -480,7 +489,7 @@ impl<F: PrimeField, CS: PolynomialCommitmentScheme<F>> ProvingKey<F, CS> {
         }
         let n_per_poly = self.permutation.polys[0].values.len();
         let polys = std::mem::take(&mut self.permutation.polys);
-        let mm = mmap_pk::spill_vec_to_disk(polys, n_per_poly)?;
+        let mm = mmap_pk::spill_vec_to_disk(config.spill_dir.as_deref(), polys, n_per_poly)?;
         self.permutation_polys_mmap = Some(std::sync::Arc::new(mm));
         Ok(())
     }
@@ -490,10 +499,13 @@ impl<F: PrimeField, CS: PolynomialCommitmentScheme<F>> ProvingKey<F, CS> {
     /// fields converted by earlier steps remain valid mapped storage, so a
     /// caller retaining the key must deliberately handle the partial result.
     #[cfg(feature = "disk-spill")]
-    pub(crate) fn spill_all_to_mmap(&mut self) -> std::io::Result<()> {
-        self.spill_fixed_polys_to_mmap()?;
-        self.spill_fixed_values_to_mmap()?;
-        self.spill_permutation_polys_to_mmap()?;
+    pub(crate) fn spill_all_to_mmap(
+        &mut self,
+        config: &crate::config::ProverConfig,
+    ) -> std::io::Result<()> {
+        self.spill_fixed_polys_to_mmap(config)?;
+        self.spill_fixed_values_to_mmap(config)?;
+        self.spill_permutation_polys_to_mmap(config)?;
 
         // Drop the cached extended-domain cosets.
         //
@@ -616,9 +628,11 @@ where
     /// makes the coset spill reachable on load, not merely a memory saving.
     ///
     /// Taking the policy as a parameter is what lets a test exercise this
-    /// without mutating process environment, and it is the seam a per-request
-    /// policy will thread through later.
-    pub(crate) fn read_with_policy<R: io::Read, ConcreteCircuit: Circuit<F>>(
+    /// without mutating process environment, and it is the seam through which
+    /// a per-request policy reaches key loading: a server holding one
+    /// [`ProverContext`](crate::config::ProverContext) per request passes
+    /// `&ctx.config` here and the same context to `create_proof_with`.
+    pub fn read_with_policy<R: io::Read, ConcreteCircuit: Circuit<F>>(
         reader: &mut R,
         format: SerdeFormat,
         #[cfg(feature = "circuit-params")] params: ConcreteCircuit::Params,
@@ -696,7 +710,7 @@ where
         // caller can retry the read explicitly with spilling disabled.
         #[cfg(feature = "disk-spill")]
         if policy.map_prover_key {
-            pk.spill_all_to_mmap()?;
+            pk.spill_all_to_mmap(policy)?;
         }
         read_stage("spill (or none)", &mut hwm);
         Ok(pk)

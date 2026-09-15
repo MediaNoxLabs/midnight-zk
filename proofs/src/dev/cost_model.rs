@@ -914,6 +914,95 @@ mod tests {
         verify(heap.get_vk(), &prove(&heap));
     }
 
+    /// Two proofs, two contexts, one cancelled: the cancelled one must fail
+    /// with the typed error at its first checkpoint, and the other must not
+    /// notice — it completes, and its proof verifies.
+    ///
+    /// This is the property the process-wide flag could not have: cancelling
+    /// one request cancelled everything. Both proofs run concurrently so the
+    /// test would catch a token that leaked across threads through shared
+    /// state, not just one that leaked within a thread.
+    #[test]
+    fn cancelling_one_proof_leaves_the_other_valid() {
+        use crate::{
+            config::{CancelToken, ProverConfig, ProverContext},
+            plonk::{create_proof_with, parse_trace, verify_algebraic_constraints, Error},
+            poly::commitment::Guard,
+        };
+
+        let k = 9;
+        let circuit = StandardPlonk::<1>(Fq::from(11u64));
+        let params = ParamsKZG::<Bls12>::unsafe_setup(k, OsRng);
+        let vk =
+            keygen_vk_with_k::<_, KZGCommitmentScheme<Bls12>, _>(&params, &circuit, k).expect("vk");
+        let pk = keygen_pk(vk, &circuit).expect("pk");
+        let instances: &[&[Fq]] = &[&[circuit.0]];
+
+        let cancelled = CancelToken::new();
+        cancelled.cancel();
+        let ctx_cancelled = ProverContext::new(ProverConfig::heap()).with_cancel(cancelled);
+        let ctx_live = ProverContext::new(ProverConfig::heap()).with_cancel(CancelToken::new());
+
+        let prove = |ctx: &ProverContext| {
+            let mut transcript = CircuitTranscript::<State>::init();
+            create_proof_with::<Fq, KZGCommitmentScheme<Bls12>, _, _>(
+                ctx,
+                &params,
+                &pk,
+                std::slice::from_ref(&circuit),
+                #[cfg(feature = "committed-instances")]
+                0,
+                &[instances],
+                OsRng,
+                &mut transcript,
+            )
+            .map(|()| transcript.finalize())
+        };
+
+        let (stopped, proved) = std::thread::scope(|s| {
+            let a = s.spawn(|| prove(&ctx_cancelled));
+            let b = s.spawn(|| prove(&ctx_live));
+            (a.join().expect("thread"), b.join().expect("thread"))
+        });
+
+        match stopped {
+            Err(Error::Cancelled { phase }) => assert_eq!(
+                phase, "create_proof.compute_trace.start",
+                "a token set before the call stops at the very first checkpoint"
+            ),
+            other => panic!("expected Error::Cancelled, got {other:?}"),
+        }
+
+        let proof = proved.expect("the uncancelled proof must complete");
+        let mut transcript = CircuitTranscript::<State>::init_from_bytes(&proof);
+        let trace = parse_trace(
+            pk.get_vk(),
+            #[cfg(feature = "committed-instances")]
+            &[&[]],
+            &[instances],
+            &mut transcript,
+        )
+        .expect("parse_trace");
+        verify_algebraic_constraints(
+            pk.get_vk(),
+            trace,
+            #[cfg(feature = "committed-instances")]
+            &[&[]],
+            &[instances],
+            &mut transcript,
+        )
+        .expect("algebraic constraints")
+        .verify(&params.verifier_params())
+        .expect("the uncancelled proof must verify");
+
+        // And key generation is outside cancellation's reach by construction:
+        // it takes no context and has no checkpoint. A cancelled token in the
+        // same process changes nothing about it.
+        let again =
+            keygen_vk_with_k::<_, KZGCommitmentScheme<Bls12>, _>(&params, &circuit, k).expect("vk");
+        keygen_pk(again, &circuit).expect("keygen is not cancellable");
+    }
+
     #[test]
     fn check_correct_computation_k() {
         let mut random_byte = [0u8; 1];

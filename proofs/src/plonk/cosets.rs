@@ -7,7 +7,10 @@
 
 #[cfg(feature = "disk-spill")]
 use crate::plonk::mmap_pk::{spill_with_transform, MmappedPolys};
-use crate::poly::{polynomial_views, Coeff, ExtendedLagrangeCoeff, Polynomial, PolynomialView};
+use crate::{
+    config::ProverConfig,
+    poly::{polynomial_views, Coeff, ExtendedLagrangeCoeff, Polynomial, PolynomialView},
+};
 
 /// Either heap-resident cosets or cosets spilled to a mapped tempfile.
 ///
@@ -45,34 +48,34 @@ impl<F> Cosets<F> {
     }
 }
 
-/// Whether the process policy spills cosets for a circuit of size `k`.
+/// Whether `config` spills cosets for a circuit of size `k`.
 ///
-/// The decision itself lives on [`ProverConfig`](crate::config::ProverConfig)
-/// and is pure; this only supplies the process-wide policy. The floor exists
-/// because spilling is a loss at small `k` — the file write and page faults
-/// cost more than the heap the small cosets would have occupied — so it earns
-/// its keep only once the cosets approach the memory ceiling.
-pub(crate) fn should_spill_cosets(k: u32) -> bool {
-    crate::config::ProverConfig::process().spills_cosets_at(k)
+/// The decision itself lives on [`ProverConfig`] and is pure; this is the
+/// prover's one place to ask it. The floor exists because spilling is a loss
+/// at small `k` — the file write and page faults cost more than the heap the
+/// small cosets would have occupied — so it earns its keep only once the
+/// cosets approach the memory ceiling.
+pub(crate) fn should_spill_cosets(k: u32, config: &ProverConfig) -> bool {
+    config.spills_cosets_at(k)
 }
 
-/// Whether [`build_cosets`] will *actually* spill: the environment gate **and**
-/// the capability to honour it.
+/// Whether [`build_cosets`] will *actually* spill: the policy gate **and** the
+/// capability to honour it.
 ///
 /// [`should_spill_cosets`] answers only "was spilling asked for". Without the
 /// `disk-spill` feature the answer can be yes while `build_cosets` still takes
-/// the heap arm, so a caller emitting phase markers off the bare env gate would
+/// the heap arm, so a caller emitting phase markers off the bare gate would
 /// report a spill that never happened. Callers wanting to narrate the choice
 /// should ask this instead — and it keeps the `cfg` here rather than at every
 /// call site.
-pub(crate) fn will_spill(k: u32) -> bool {
+pub(crate) fn will_spill(k: u32, config: &ProverConfig) -> bool {
     #[cfg(feature = "disk-spill")]
     {
-        should_spill_cosets(k)
+        should_spill_cosets(k, config)
     }
     #[cfg(not(feature = "disk-spill"))]
     {
-        let _ = k;
+        let _ = (k, config);
         false
     }
 }
@@ -83,7 +86,12 @@ pub(crate) fn will_spill(k: u32) -> bool {
 /// A spill failure is **not** fatal: it falls back to the heap path and the
 /// proof is still produced. Running out of tempfile space should degrade to the
 /// behaviour we had before this optimisation existed, not abort a proof.
-pub(crate) fn build_cosets<F, P, D>(polys: &[P], k: u32, to_extended: D) -> Cosets<F>
+pub(crate) fn build_cosets<F, P, D>(
+    polys: &[P],
+    k: u32,
+    config: &ProverConfig,
+    to_extended: D,
+) -> Cosets<F>
 where
     F: Copy + Send + Sync,
     P: crate::poly::PolynomialRead<F, Basis = Coeff> + Sync,
@@ -94,8 +102,8 @@ where
     use rayon::prelude::*;
 
     #[cfg(feature = "disk-spill")]
-    if should_spill_cosets(k) && !polys.is_empty() {
-        match spill_with_transform(polys, &to_extended) {
+    if should_spill_cosets(k, config) && !polys.is_empty() {
+        match spill_with_transform(config.spill_dir.as_deref(), polys, &to_extended) {
             Ok(m) => return Cosets::Spilled(m),
             Err(error) => {
                 tracing::warn!(%error, k, "coset spill failed; falling back to heap");
@@ -109,10 +117,10 @@ where
             }
         }
     }
-    // Without `disk-spill` the gate is dead weight; keep the parameter so the
+    // Without `disk-spill` the gate is dead weight; keep the parameters so the
     // signature does not change with the feature.
     #[cfg(not(feature = "disk-spill"))]
-    let _ = (k, should_spill_cosets(k));
+    let _ = (k, should_spill_cosets(k, config));
     // The heap arm stays parallel. Spilling is sequential by construction —
     // streaming one polynomial at a time is what keeps peak heap at ~1 poly —
     // so the two arms trade throughput against memory, and the default path
@@ -161,7 +169,7 @@ mod test {
         // - or the caller's shell - may have set, which is exactly what
         // splitting `spill_decision` out was meant to avoid.
         let heap = Cosets::Heap(polynomial_views(&polys).into_iter().map(widen).collect());
-        let spilled = Cosets::Spilled(spill_with_transform(&polys, widen).unwrap());
+        let spilled = Cosets::Spilled(spill_with_transform(None, &polys, widen).unwrap());
 
         let heap = heap.views();
         let spilled = spilled.views();

@@ -344,8 +344,11 @@ fn bench_zswap_output(c: &mut Criterion) {
         "keygen" => {
             #[cfg(feature = "disk-spill")]
             let pk = if spill_pk {
-                midnight_proofs::plonk::bench::prover::spill_proving_key(pk)
-                    .expect("Failed to prepare mmap-backed proving key")
+                midnight_proofs::plonk::bench::prover::spill_proving_key(
+                    pk,
+                    midnight_proofs::config::ProverConfig::process(),
+                )
+                .expect("Failed to prepare mmap-backed proving key")
             } else {
                 pk
             };

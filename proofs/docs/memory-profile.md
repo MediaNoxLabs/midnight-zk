@@ -80,6 +80,11 @@ Peak transient heap becomes roughly one coset rather than all of them.
 
 All three are behind `mmap` and `disk-spill` features, off by default, and the
 policy is a value — `config::ProverConfig` — not a set of environment reads.
+A `config::ProverContext` carries that value plus an optional `CancelToken`
+through `ProvingKey::read_with_policy` and `plonk::create_proof_with`, so two
+proofs in one process can hold different policies and be cancelled
+independently; cancellation is `Error::Cancelled`, not a panic. The
+context-free entry points still exist and run under the environment's policy.
 
 ## Alternatives considered, and why not
 
@@ -139,5 +144,11 @@ because spilling has to map back what it wrote.
 ## What is deliberately not here
 
 Policy beyond the crate: choosing a profile per device class, admission
-control, and telemetry belong to the consumer. `ProverConfig` is the seam; the
+control, and telemetry belong to the consumer. `ProverContext` is the seam; the
 decision is not ours to make from inside a proving library.
+
+One knob is deliberately still process-wide: the MSM chunk size. It sits under
+`PolynomialCommitmentScheme::commit(params, poly)`, a public trait with no
+per-call seam, and widening that trait for a tuning knob would be a bigger
+change than the knob is worth. It is validated before the shift instead, and
+documented as the exception.

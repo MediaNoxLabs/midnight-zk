@@ -28,6 +28,7 @@ use super::{
 use crate::poly::EvaluationDomain;
 use crate::{
     circuit::Value,
+    config::{ProverConfig, ProverContext},
     plonk::{traces::ProverTrace, trash},
     poly::{
         batch_invert_rational, commitment::PolynomialCommitmentScheme, polynomial_views, Coeff,
@@ -63,6 +64,7 @@ where
 /// are zero-padded internally.
 ///
 /// The trace can then be used to finalise proofs, or to fold them.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn compute_trace<
     F,
     CS: PolynomialCommitmentScheme<F>,
@@ -79,6 +81,7 @@ pub(crate) fn compute_trace<
     instances: &[&[&[F]]],
     rng: &mut (impl RngCore + CryptoRng),
     transcript: &mut T,
+    ctx: &ProverContext,
 ) -> Result<ProverTrace<F>, Error>
 where
     CS::Commitment: Hashable<T::Hash>,
@@ -109,19 +112,19 @@ where
 
     let domain = &pk.vk.domain;
 
-    log_phase("trace.compute_instances.start");
+    checkpoint(ctx, "trace.compute_instances.start")?;
     let instance = compute_instances(params, pk, instances, nb_committed_instances, transcript)?;
-    log_phase("trace.compute_instances.end");
+    checkpoint(ctx, "trace.compute_instances.end")?;
 
-    log_phase("trace.parse_advices.start");
+    checkpoint(ctx, "trace.parse_advices.start")?;
     let (advice, challenges) = parse_advices(params, pk, circuits, instances, transcript, rng)?;
-    log_phase("trace.parse_advices.end");
+    checkpoint(ctx, "trace.parse_advices.end")?;
     let fixed_value_views = pk.fixed_values_views();
 
     // Sample theta challenge for keeping lookup columns linearly independent
     let theta: F = transcript.squeeze_challenge();
 
-    log_phase("trace.lookups_permuted.start");
+    checkpoint(ctx, "trace.lookups_permuted.start")?;
     let lookups: Vec<Vec<lookup::prover::Permuted<F>>> = instance
         .iter()
         .zip(advice.iter())
@@ -151,7 +154,7 @@ where
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    log_phase("trace.lookups_permuted.end");
+    checkpoint(ctx, "trace.lookups_permuted.end")?;
 
     // Sample beta challenge
     let beta: F = transcript.squeeze_challenge();
@@ -159,7 +162,7 @@ where
     // Sample gamma challenge
     let gamma: F = transcript.squeeze_challenge();
 
-    log_phase("trace.permutations_commit.start");
+    checkpoint(ctx, "trace.permutations_commit.start")?;
     // Commit to permutations.
     let permutations: Vec<permutation::prover::Committed<F>> = instance
         .iter()
@@ -182,9 +185,9 @@ where
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    log_phase("trace.permutations_commit.end");
+    checkpoint(ctx, "trace.permutations_commit.end")?;
 
-    log_phase("trace.lookups_product.start");
+    checkpoint(ctx, "trace.lookups_product.start")?;
     let lookups: Vec<Vec<lookup::prover::Committed<F>>> = lookups
         .into_iter()
         .map(|lookups| -> Result<Vec<_>, _> {
@@ -195,7 +198,7 @@ where
                 .collect::<Result<Vec<_>, _>>()
         })
         .collect::<Result<Vec<_>, _>>()?;
-    log_phase("trace.lookups_product.end");
+    checkpoint(ctx, "trace.lookups_product.end")?;
 
     // Trash argument
     let trash_challenge: F = transcript.squeeze_challenge();
@@ -360,30 +363,42 @@ pub(crate) fn sample_rss_hwm_kb() -> Option<(u64, u64)> {
     None
 }
 
-// R3 — cooperative cancellation flag. The FFI host (or any other
-// caller) sets this to `true` to request the prover abort at the
-// next phase boundary. The prover checks the flag inside
-// `log_phase` and panics with a specific sentinel message that
-// the FFI's `catch_unwind` recognises and maps to
-// `ProverError::Cancelled`. Reset to `false` at the start of
-// every prove call (the FFI is responsible).
-//
-// Granularity is one phase (≈10-30 phase boundaries per prove
-// at k=21); fine enough for "stop within a few seconds" UX
-// without threading a `cancel_token` parameter through every
-// internal call.
-/// R3 — cooperative cancel flag. Setting to `true` causes the
-/// next `log_phase` boundary to panic with the sentinel; the FFI's
-/// `catch_unwind` maps the panic to `ProverError::Cancelled`. The
-/// flag is auto-reset by the FFI on every fresh prove call.
+/// The process-wide cancellation flag, kept for callers that predate
+/// per-request tokens.
+///
+/// It is the token behind [`ProverContext::process`], which is what every
+/// context-free entry point uses: a host that sets this flag still stops the
+/// prover at its next phase boundary. What changed is the outcome — the prover
+/// now returns [`Error::Cancelled`] rather than panicking, and the error's
+/// message carries [`MIDNIGHT_CANCEL_SENTINEL`] so a host that recognised
+/// cancellation by that substring keeps doing so.
+///
+/// Because it is process-wide, it cancels *every* proof that is using the
+/// process context — which is exactly why new callers should hold a
+/// [`CancelToken`](crate::config::CancelToken) of their own through
+/// [`create_proof_with`] instead. The host remains responsible for resetting
+/// the flag before its next proof; a token needs no reset.
 pub static MIDNIGHT_CANCEL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// R3 — sentinel message the prover panics with when MIDNIGHT_CANCEL
-/// is observed set. The FFI's catch_unwind path matches this
-/// substring to map the panic to `ProverError::Cancelled` instead
-/// of `ProverError::ProveFailed`.
+/// The substring hosts have matched to recognise cancellation. It used to be
+/// the panic message; it is now part of [`Error::Cancelled`]'s `Display`.
 pub const MIDNIGHT_CANCEL_SENTINEL: &str = "MIDNIGHT_CANCELLED_BY_HOST";
+
+/// Consult the context at a phase boundary: emit the phase marker, then stop
+/// with [`Error::Cancelled`] if this proof's token has been set.
+///
+/// Every phase boundary in the prover goes through here, so cancellation lands
+/// within one phase — around 30 boundaries per proof — and only for the proof
+/// whose context this is. Key generation has no context and no checkpoint;
+/// nothing can cancel it.
+pub(crate) fn checkpoint(ctx: &ProverContext, name: &'static str) -> Result<(), Error> {
+    log_phase(name);
+    if ctx.is_cancelled() {
+        return Err(Error::Cancelled { phase: name });
+    }
+    Ok(())
+}
 
 /// Emit a phase-marker tracing event. Captured by both
 /// `WalletLogLayer` (→ Logs tab + redb persistence) and
@@ -392,13 +407,10 @@ pub const MIDNIGHT_CANCEL_SENTINEL: &str = "MIDNIGHT_CANCELLED_BY_HOST";
 /// call; `hwm_mb` is the high-water mark across the process
 /// lifetime so far. Together they show which phase is responsible
 /// for each step-up in peak memory.
+///
+/// Purely observational. Cancellation is [`checkpoint`]'s job, so a marker
+/// emitted from inside a closure that cannot return an error stays a marker.
 fn log_phase(name: &'static str) {
-    // R3 — check cooperative cancellation flag first. If set,
-    // panic with the sentinel — the FFI catch_unwind will
-    // recognise + map to ProverError::Cancelled.
-    if MIDNIGHT_CANCEL.load(std::sync::atomic::Ordering::Relaxed) {
-        panic!("{MIDNIGHT_CANCEL_SENTINEL}: cancelled at phase {name}");
-    }
     if let Some((rss_kb, hwm_kb)) = sample_rss_hwm_kb() {
         tracing::info!(
             target: "midnight_bench",
@@ -429,6 +441,7 @@ pub(crate) fn finalise_proof<'a, F, CS: PolynomialCommitmentScheme<F>, T: Transc
     trace: ProverTrace<F>,
     rng: &mut (impl RngCore + CryptoRng),
     transcript: &mut T,
+    ctx: &ProverContext,
 ) -> Result<(), Error>
 where
     CS::Commitment: Hashable<T::Hash>,
@@ -444,9 +457,9 @@ where
 
     let domain = pk.get_vk().get_domain();
 
-    log_phase("finalise.compute_h_poly.start");
-    let h_poly = compute_h_poly(pk, &trace);
-    log_phase("finalise.compute_h_poly.end");
+    checkpoint(ctx, "finalise.compute_h_poly.start")?;
+    let h_poly = compute_h_poly(pk, &trace, &ctx.config);
+    checkpoint(ctx, "finalise.compute_h_poly.end")?;
 
     let ProverTrace {
         advice_polys,
@@ -459,9 +472,9 @@ where
     } = trace;
 
     // Construct the vanishing argument's h(X) commitments
-    log_phase("finalise.vanishing_construct.start");
+    checkpoint(ctx, "finalise.vanishing_construct.start")?;
     let vanishing = vanishing.construct::<CS, T>(params, domain, h_poly, rng, transcript)?;
-    log_phase("finalise.vanishing_construct.end");
+    checkpoint(ctx, "finalise.vanishing_construct.end")?;
 
     let x: F = transcript.squeeze_challenge();
 
@@ -508,7 +521,7 @@ where
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    log_phase("finalise.compute_queries.start");
+    checkpoint(ctx, "finalise.compute_queries.start")?;
     let queries = compute_queries(
         pk,
         nb_committed_instances,
@@ -520,10 +533,10 @@ where
         &vanishing,
         x,
     );
-    log_phase("finalise.multi_open.start");
+    checkpoint(ctx, "finalise.multi_open.start")?;
     let res =
         CS::multi_open(params, &queries, transcript).map_err(|_| Error::ConstraintSystemFailure);
-    log_phase("finalise.multi_open.end");
+    checkpoint(ctx, "finalise.multi_open.end")?;
     res
 }
 
@@ -531,6 +544,11 @@ where
 /// parameters `params` and the proving key [`ProvingKey`] that was
 /// generated previously for the same circuit. The provided `instances`
 /// are zero-padded internally.
+///
+/// Runs under the process-wide [`ProverContext::process`]: the memory policy
+/// the environment variables describe, and the [`MIDNIGHT_CANCEL`] flag as
+/// its cancellation token. Callers that need a policy or a token of their own
+/// use [`create_proof_with`]; this is that function with the process context.
 //
 // NOTE: Any change here must be mirrored in src/plonk/bench/prover.rs
 // to ensure the benchmarks remain aligned with the real prover.
@@ -557,8 +575,53 @@ where
         + Ord
         + FromUniformBytes<64>,
 {
-    let mut rng = rng;
-    log_phase("create_proof.compute_trace.start");
+    create_proof_with(
+        &ProverContext::process(),
+        params,
+        pk,
+        circuits,
+        #[cfg(feature = "committed-instances")]
+        nb_committed_instances,
+        instances,
+        rng,
+        transcript,
+    )
+}
+
+/// [`create_proof`] with an explicit [`ProverContext`]: this proof's memory
+/// policy and, optionally, a cancellation token that stops *this proof only*.
+///
+/// The context is borrowed for the duration of the call. Two proofs in one
+/// process may hold different contexts — one on the heap, one spilling — and
+/// cancelling one through its token leaves the other, and any key generation,
+/// untouched. Cancellation surfaces as [`Error::Cancelled`] at the next phase
+/// boundary; nothing is left half-written.
+#[allow(clippy::too_many_arguments)]
+pub fn create_proof_with<
+    F,
+    CS: PolynomialCommitmentScheme<F>,
+    T: Transcript,
+    ConcreteCircuit: Circuit<F>,
+>(
+    ctx: &ProverContext,
+    params: &CS::Parameters,
+    pk: &ProvingKey<F, CS>,
+    circuits: &[ConcreteCircuit],
+    #[cfg(feature = "committed-instances")] nb_committed_instances: usize,
+    instances: &[&[&[F]]],
+    mut rng: impl RngCore + CryptoRng,
+    transcript: &mut T,
+) -> Result<(), Error>
+where
+    CS::Commitment: Hashable<T::Hash>,
+    F: WithSmallOrderMulGroup<3>
+        + Sampleable<T::Hash>
+        + Hashable<T::Hash>
+        + Hash
+        + Ord
+        + FromUniformBytes<64>,
+{
+    checkpoint(ctx, "create_proof.compute_trace.start")?;
     let trace = compute_trace(
         params,
         pk,
@@ -568,9 +631,10 @@ where
         instances,
         &mut rng,
         transcript,
+        ctx,
     )?;
-    log_phase("create_proof.compute_trace.end");
-    log_phase("create_proof.finalise_proof.start");
+    checkpoint(ctx, "create_proof.compute_trace.end")?;
+    checkpoint(ctx, "create_proof.finalise_proof.start")?;
     let res = finalise_proof(
         params,
         pk,
@@ -579,8 +643,9 @@ where
         trace,
         &mut rng,
         transcript,
+        ctx,
     );
-    log_phase("create_proof.finalise_proof.end");
+    checkpoint(ctx, "create_proof.finalise_proof.end")?;
     res
 }
 
@@ -790,6 +855,7 @@ where
 pub(super) fn compute_h_poly<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitmentScheme<F>>(
     pk: &ProvingKey<F, CS>,
     trace: &ProverTrace<F>,
+    config: &ProverConfig,
 ) -> Polynomial<F, ExtendedLagrangeCoeff> {
     let ProverTrace {
         advice_polys,
@@ -828,7 +894,7 @@ pub(super) fn compute_h_poly<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitm
     // for the capability as well as the switch, so a phase marker never
     // reports a spill that the build could not have performed.
     let k = pk.vk.domain.k();
-    let narrate_spill = will_spill(k);
+    let narrate_spill = will_spill(k, config);
 
     // Calculate the advice and instance cosets.
     let advice_cosets: Vec<Cosets<F>> = advice_polys
@@ -837,7 +903,7 @@ pub(super) fn compute_h_poly<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitm
             if narrate_spill {
                 log_phase("finalise.compute_h_poly.spill_advice_cosets.start");
             }
-            let c = build_cosets(advice_polys, k, |poly| {
+            let c = build_cosets(advice_polys, k, config, |poly| {
                 pk.vk.get_domain().coeff_to_extended(poly.materialise())
             });
             if narrate_spill {
@@ -852,7 +918,7 @@ pub(super) fn compute_h_poly<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitm
             if narrate_spill {
                 log_phase("finalise.compute_h_poly.spill_instance_cosets.start");
             }
-            let c = build_cosets(instance_polys, k, |poly| {
+            let c = build_cosets(instance_polys, k, config, |poly| {
                 pk.vk.get_domain().coeff_to_extended(poly.materialise())
             });
             if narrate_spill {
@@ -909,7 +975,7 @@ pub(super) fn compute_h_poly<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitm
             "finalise.compute_h_poly.materialise_fixed_cosets.start"
         });
         let fixed_polys = pk.fixed_polys_views();
-        let built = build_cosets(&fixed_polys, k, |p| {
+        let built = build_cosets(&fixed_polys, k, config, |p| {
             pk.vk.domain.coeff_to_extended(p.materialise())
         });
         log_phase(if narrate_spill {
@@ -935,7 +1001,7 @@ pub(super) fn compute_h_poly<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitm
             "finalise.compute_h_poly.materialise_perm_cosets.start"
         });
         let permutation_polys = pk.permutation_polys_views();
-        let built = build_cosets(&permutation_polys, k, |p| {
+        let built = build_cosets(&permutation_polys, k, config, |p| {
             pk.vk.domain.coeff_to_extended(p.materialise())
         });
         log_phase(if narrate_spill {
@@ -1300,7 +1366,7 @@ fn test_create_proof() {
         use crate::utils::SerdeFormat;
 
         let expected = pk.to_bytes(SerdeFormat::RawBytesUnchecked);
-        pk.spill_all_to_mmap().expect("PK spill should not fail");
+        pk.spill_all_to_mmap(&ProverConfig::heap()).expect("PK spill should not fail");
         assert_eq!(
             pk.to_bytes(SerdeFormat::RawBytesUnchecked),
             expected,

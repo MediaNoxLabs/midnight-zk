@@ -414,13 +414,16 @@ where
 
     let domain = pk.get_vk().get_domain();
 
+    // The benchmark measures the process policy — that is what the
+    // environment-driven harness sets up.
+    let config = crate::config::ProverConfig::process();
     let h_poly = {
         group.bench_function("Compute H poly", |b| {
             b.iter(|| {
-                let _ = compute_h_poly(pk, &trace);
+                let _ = compute_h_poly(pk, &trace, config);
             })
         });
-        compute_h_poly(pk, &trace)
+        compute_h_poly(pk, &trace, config)
     };
 
     let ProverTrace {
@@ -588,12 +591,15 @@ where
 /// `&mut` signature left exactly that — and the emptied field reads back as an
 /// empty slice, so the next proof would be built from nothing.
 #[cfg(feature = "disk-spill")]
-pub fn spill_proving_key<F, CS>(mut pk: ProvingKey<F, CS>) -> std::io::Result<ProvingKey<F, CS>>
+pub fn spill_proving_key<F, CS>(
+    mut pk: ProvingKey<F, CS>,
+    config: &crate::config::ProverConfig,
+) -> std::io::Result<ProvingKey<F, CS>>
 where
     F: PrimeField,
     CS: PolynomialCommitmentScheme<F>,
 {
-    pk.spill_all_to_mmap()?;
+    pk.spill_all_to_mmap(config)?;
     Ok(pk)
 }
 
