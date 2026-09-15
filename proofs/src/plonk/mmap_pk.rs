@@ -107,9 +107,23 @@ impl<F, B> MmappedPolys<F, B> {
 /// directory arrives as a parameter rather than being read from process state
 /// so that two proofs in one process can spill to different volumes.
 fn make_tempfile(spill_dir: Option<&std::path::Path>) -> io::Result<std::fs::File> {
+    // The error names the operation and the directory. Without that a caller
+    // sees "No such file or directory" for a file that was never meant to
+    // exist, and a proof server turns a misconfigured spill volume into a
+    // client error blaming the request.
     match spill_dir {
-        Some(dir) => tempfile::tempfile_in(dir),
-        None => tempfile::tempfile(),
+        Some(dir) => tempfile::tempfile_in(dir).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("create spill temp file in {}: {e}", dir.display()),
+            )
+        }),
+        None => tempfile::tempfile().map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("create spill temp file in the OS temp dir: {e}"),
+            )
+        }),
     }
 }
 
