@@ -1091,11 +1091,25 @@ mod tests {
                 &policy,
             );
         match result {
-            Err(e) => assert_eq!(
-                e.kind(),
-                std::io::ErrorKind::NotFound,
-                "the tempfile failure must surface as the io error it was: {e}"
-            ),
+            Err(e) => {
+                assert_eq!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound,
+                    "the tempfile failure must surface as the io error it was: {e}"
+                );
+                // An operator reading this from a server log must learn which
+                // directory failed and what was attempted there, not just
+                // "No such file or directory" for a file nobody asked for.
+                let text = e.to_string();
+                assert!(
+                    text.contains("/nonexistent-midnight-spill-dir/for-this-test"),
+                    "the error must name the spill directory: {text}"
+                );
+                assert!(
+                    text.contains("create spill temp file"),
+                    "the error must name the operation: {text}"
+                );
+            }
             Ok(_) => panic!("a failed key spill must reject the load, not hand back a key"),
         }
     }

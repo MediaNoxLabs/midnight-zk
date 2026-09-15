@@ -118,6 +118,23 @@ impl sealed::Sealed for midnight_curves::G1Projective {}
 #[allow(unsafe_code)]
 unsafe impl PlainBytes for midnight_curves::G1Projective {}
 
+// The SAFETY argument above quotes a layout: 144 bytes, `u64`-aligned. The
+// companion file's identity *detects* a layout change at read time (F-024);
+// these pin it at compile time, so a `blst`, compiler or target change that
+// alters the layout fails the build here, next to the claim it invalidates,
+// rather than at the first read of a file written by the previous build.
+#[cfg(feature = "mmap")]
+const _: () = {
+    assert!(
+        core::mem::size_of::<midnight_curves::G1Projective>() == 3 * 6 * 8,
+        "G1Projective is no longer three [u64; 6] with no padding; the PlainBytes argument is void"
+    );
+    assert!(
+        core::mem::align_of::<midnight_curves::G1Projective>() == core::mem::align_of::<u64>(),
+        "G1Projective alignment changed; the companion block layout assumes u64 alignment"
+    );
+};
+
 /// Storage backing for an SRS basis vector.
 pub(crate) enum BasesStorage<C: 'static> {
     /// Heap-allocated. The default for `unsafe_setup`, the eager

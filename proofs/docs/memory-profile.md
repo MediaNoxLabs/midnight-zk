@@ -139,7 +139,19 @@ because spilling has to map back what it wrote.
   attacker can write yields wrong proofs. Both entry points are bounded on the
   sealed `PlainBytes` trait, so the byte reinterpretation is only reachable for
   curves whose layout this crate has checked. The trust boundary is stated on
-  both entry points.
+  both entry points. The layout the `PlainBytes` argument quotes is also
+  pinned by compile-time assertions next to the `impl`, so a `blst`, compiler
+  or target change that alters it fails the build there rather than being
+  caught only by the identity at the first read.
+- **A misconfigured spill directory fails loudly and names itself.** A key
+  load whose `spill_dir` cannot take a temp file is rejected whole — no
+  half-spilled key, no silent fallback to the heap — and the error carries the
+  operation and the directory (`create spill temp file in /spill: …`), so an
+  operator can tell a bad volume from a bad request. Two deployment facts
+  learned the hard way: on Docker Desktop a **bind-mounted host directory**
+  makes that temp-file creation fail with `ENOENT` even though the directory
+  exists (use a named volume or a VM-local path), and `tmpfs` works but is
+  memory-backed, which defeats what spill is for.
 
 ## What is deliberately not here
 
