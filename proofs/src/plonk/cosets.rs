@@ -179,6 +179,54 @@ mod test {
         }
     }
 
+    /// Failure injection for the coset spill stage: a `spill_dir` that cannot
+    /// hold a tempfile makes the spill fail at `make_tempfile`, and the
+    /// documented behaviour is to fall back to the heap arm with the same
+    /// values — the proof is still produced, only the memory benefit is lost.
+    ///
+    /// This is the test MZK-006 deferred: injecting the failure needs
+    /// `spill_dir` to be settable per call, which the request-scoped policy
+    /// (MZK-007) made possible without touching process environment.
+    #[test]
+    #[cfg(feature = "disk-spill")]
+    fn a_spill_whose_directory_does_not_exist_falls_back_to_the_heap() {
+        let polys: Vec<Polynomial<Fp, Coeff>> = (0..3)
+            .map(|i| Polynomial {
+                values: (0..8).map(|j| Fp::from((i * 8 + j) as u64)).collect(),
+                _marker: std::marker::PhantomData,
+            })
+            .collect();
+        let widen = |p: PolynomialView<'_, Fp, Coeff>| Polynomial::<Fp, ExtendedLagrangeCoeff> {
+            values: p.to_vec(),
+            _marker: std::marker::PhantomData,
+        };
+
+        let nowhere = std::path::PathBuf::from("/nonexistent-midnight-spill-dir/for-this-test");
+        assert!(!nowhere.exists());
+        let config = ProverConfig {
+            spill_cosets: true,
+            coset_spill_floor_k: 0,
+            spill_dir: Some(nowhere),
+            ..ProverConfig::heap()
+        };
+        assert!(
+            config.spills_cosets_at(3),
+            "the gate must be asking for a spill for the injection to mean anything"
+        );
+
+        let built = build_cosets(&polys, 3, &config, widen);
+        assert!(
+            matches!(built, Cosets::Heap(_)),
+            "a failed spill must degrade to the heap arm, not abort or return Spilled"
+        );
+        let expected = Cosets::Heap(polynomial_views(&polys).into_iter().map(widen).collect());
+        let (got, want) = (built.views(), expected.views());
+        assert_eq!(got.len(), want.len());
+        for (g, w) in got.iter().zip(&want) {
+            assert_eq!(&g[..], &w[..], "the fallback must carry the same values");
+        }
+    }
+
     // The gate itself is now `ProverConfig::spills_cosets_at`, and
     // `config::test::the_spill_gate_needs_both_the_switch_and_the_floor`
     // asserts the same property against the type that owns it. Keeping a

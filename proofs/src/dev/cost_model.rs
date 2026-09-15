@@ -1048,6 +1048,58 @@ mod tests {
         keygen_pk(again, &circuit).expect("keygen is not cancellable");
     }
 
+    /// Failure injection for the key-spill stage: a `spill_dir` that cannot
+    /// hold a tempfile makes the first `spill_*_to_mmap` fail, and the load
+    /// must be rejected outright — an `Err` and no key — because by then an
+    /// owned vector may already have been moved out. Handing back the
+    /// partially converted key was review finding F-019; this pins the fix
+    /// from the caller's side, on a fixture that genuinely has fixed and
+    /// permutation polynomials to spill.
+    ///
+    /// Deferred by MZK-006 because injecting the failure needs `spill_dir`
+    /// per call; the request-scoped policy (MZK-007) made it a plain
+    /// parameter, so no environment is touched.
+    #[cfg(feature = "disk-spill")]
+    #[test]
+    fn a_key_load_whose_spill_directory_does_not_exist_is_rejected_whole() {
+        use crate::{config::ProverConfig, plonk::ProvingKey, utils::SerdeFormat};
+
+        let k = 9;
+        let circuit = StandardPlonk::<1>(Fq::from(5u64));
+        let params = ParamsKZG::<Bls12>::unsafe_setup(k, OsRng);
+        let vk =
+            keygen_vk_with_k::<_, KZGCommitmentScheme<Bls12>, _>(&params, &circuit, k).expect("vk");
+        let fresh = keygen_pk(vk, &circuit).expect("pk");
+        assert!(
+            !fresh.fixed_polys.is_empty(),
+            "the fixture must have something to spill for the injection to reach a spill stage"
+        );
+        let bytes = fresh.to_bytes(SerdeFormat::RawBytesUnchecked);
+
+        let nowhere = std::path::PathBuf::from("/nonexistent-midnight-spill-dir/for-this-test");
+        assert!(!nowhere.exists());
+        let policy = ProverConfig {
+            spill_dir: Some(nowhere),
+            ..ProverConfig::mapped_key()
+        };
+        let result =
+            ProvingKey::<Fq, KZGCommitmentScheme<Bls12>>::read_with_policy::<_, StandardPlonk<1>>(
+                &mut &bytes[..],
+                SerdeFormat::RawBytesUnchecked,
+                #[cfg(feature = "circuit-params")]
+                (),
+                &policy,
+            );
+        match result {
+            Err(e) => assert_eq!(
+                e.kind(),
+                std::io::ErrorKind::NotFound,
+                "the tempfile failure must surface as the io error it was: {e}"
+            ),
+            Ok(_) => panic!("a failed key spill must reject the load, not hand back a key"),
+        }
+    }
+
     #[test]
     fn check_correct_computation_k() {
         let mut random_byte = [0u8; 1];
