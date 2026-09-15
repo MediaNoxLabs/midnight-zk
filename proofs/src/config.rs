@@ -14,31 +14,47 @@
 //! a phone at k=20 needs all of it — so the choice has to be expressible.
 //!
 //! It used to be expressed as five environment variables read at the points
-//! that needed them. That has three costs, and they are the reasons this
-//! module exists rather than a matter of taste:
+//! that needed them, plus one process-wide cancel flag. That had three costs,
+//! and they are the reasons this module exists rather than a matter of taste:
 //!
-//! 1. **Process-global.** Two provers in one process cannot differ. A server
-//!    that wants a small circuit on the heap and a large one spilled has no way
-//!    to say so.
-//! 2. **Invisible.** Nothing in any signature says the prover's behaviour
-//!    depends on the environment, so a caller cannot discover the knobs, and a
-//!    reviewer cannot see them.
+//! 1. **Process-global.** Two provers in one process could not differ. A server
+//!    that wants a small circuit on the heap and a large one spilled had no way
+//!    to say so — and cancelling one request's proof cancelled every proof in
+//!    the process, key generation included.
+//! 2. **Invisible.** Nothing in any signature said the prover's behaviour
+//!    depended on the environment, so a caller could not discover the knobs,
+//!    and a reviewer could not see them.
 //! 3. **Hostile to testing.** Setting an environment variable in a test is
-//!    `unsafe` under Rust 2024 and races every other test in the binary. The
-//!    coset gate already had to be split in two — `spill_decision` apart from
-//!    `should_spill_cosets` — purely so the logic could be reached without
-//!    touching the environment. That split is a symptom.
+//!    `unsafe` under Rust 2024 and races every other test in the binary.
 //!
-//! [`ProverConfig`] is plain data. Every decision is a method on it, so the
-//! decisions are directly testable. Reading the environment happens in exactly
-//! one function, [`ProverConfig::from_env`], at the process boundary.
+//! [`ProverConfig`] is plain data: every memory decision is a method on it, so
+//! the decisions are directly testable. [`ProverContext`] carries a config and
+//! an optional [`CancelToken`] through key loading
+//! (`ProvingKey::read_with_policy`) and proof creation
+//! (`plonk::create_proof_with`), borrowed, so two requests in one process hold
+//! two contexts and neither can see the other. Reading the environment happens
+//! in exactly one function, [`ProverConfig::from_env`], at the process
+//! boundary.
+//!
+//! One knob stays process-wide: the MSM chunk size. The commitment trait's
+//! `commit(params, poly)` has no per-call seam, and widening that public trait
+//! is a larger ask than the knob deserves. It is validated before use instead.
 //!
 //! # Compatibility
 //!
-//! The variables still work and mean exactly what they meant before. They are
-//! now parsed once, in one place, instead of at six call sites.
+//! The variables still work and mean exactly what they meant before; the
+//! context-free entry points (`create_proof`, `ProvingKey::read`) run under
+//! [`ProverContext::process`], which is the environment's policy plus the
+//! legacy `MIDNIGHT_CANCEL` flag. The one visible change is that a set flag
+//! yields `Error::Cancelled` rather than a panic.
 
-use std::{path::PathBuf, sync::OnceLock};
+use std::{
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, OnceLock,
+    },
+};
 
 /// Default `k` at or above which coset spilling engages, when enabled.
 ///
@@ -154,17 +170,30 @@ impl ProverConfig {
                 .ok()
                 .filter(|d| !d.is_empty())
                 .map(PathBuf::from),
-            msm_chunk_log2: env_parse("MIDNIGHT_MSM_CHUNK_LOG2").unwrap_or(DEFAULT_MSM_CHUNK_LOG2),
+            msm_chunk_log2: match env_parse::<u32>("MIDNIGHT_MSM_CHUNK_LOG2") {
+                Some(log2) if log2 < usize::BITS => log2,
+                Some(log2) => {
+                    // Not silently: an operator who typed 64 meant something,
+                    // and "chunking disabled" is the closest legal reading.
+                    tracing::warn!(
+                        log2,
+                        max = usize::BITS - 1,
+                        "MIDNIGHT_MSM_CHUNK_LOG2 is out of range; chunking disabled"
+                    );
+                    usize::BITS - 1
+                }
+                None => DEFAULT_MSM_CHUNK_LOG2,
+            },
         }
     }
 
     /// The process-wide policy, read from the environment on first use.
     ///
-    /// A stepping stone, not the destination. It exists so the call sites can
-    /// stop reading the environment themselves without every prover entry
-    /// point growing a parameter in the same change. Threading a config
-    /// through the prover is what finally allows two provers in one process to
-    /// differ — see the module docs.
+    /// This is the compatibility bridge behind [`ProverContext::process`]:
+    /// what a caller gets when it uses an entry point that takes no context.
+    /// It is read once and frozen for the process, so a host that sets the
+    /// variables must do so before the first proof. Callers that want per-proof
+    /// policy build a [`ProverConfig`] directly and pass a [`ProverContext`].
     pub fn process() -> &'static ProverConfig {
         static PROCESS: OnceLock<ProverConfig> = OnceLock::new();
         PROCESS.get_or_init(ProverConfig::from_env)
@@ -180,8 +209,134 @@ impl ProverConfig {
     }
 
     /// Chunk size for the Pippenger fallback.
+    ///
+    /// `msm_chunk_log2` is clamped to `usize::BITS - 1` before the shift, so
+    /// an out-of-range value — `64` from the environment, or the documented
+    /// "disable" value `32` on a 32-bit target — disables chunking rather than
+    /// overflowing. `1 << 31` on 32-bit or `1 << 63` on 64-bit is larger than
+    /// any MSM, which is what "disabled" means here anyway.
     pub fn msm_chunk(&self) -> usize {
-        1usize << self.msm_chunk_log2
+        1usize << self.msm_chunk_log2.min(usize::BITS - 1)
+    }
+}
+
+/// A request-scoped cancellation flag.
+///
+/// One token belongs to one proof. Setting it stops *that* proof at its next
+/// phase checkpoint with [`Error::Cancelled`](crate::plonk::Error::Cancelled);
+/// it cannot reach a proof holding a different token, and it cannot reach key
+/// generation, which checks no token at all. Clone it to hand the caller a
+/// handle while the prover holds the other — both see the same flag.
+///
+/// The prover only ever *reads* the token, at phase boundaries — around 30 per
+/// proof — so cancellation lands within one phase, which is the same
+/// granularity the process-wide flag offered, without the process-wide part.
+#[derive(Clone, Debug)]
+pub struct CancelToken(TokenFlag);
+
+#[derive(Clone, Debug)]
+enum TokenFlag {
+    /// A flag this token owns, shared only with its clones.
+    Owned(Arc<AtomicBool>),
+    /// The process-wide flag behind [`ProverContext::process`], kept so the
+    /// pre-existing host protocol — set a static, expect the prover to stop —
+    /// keeps working while callers move to per-request tokens.
+    Shared(&'static AtomicBool),
+}
+
+impl CancelToken {
+    /// A fresh token, not cancelled.
+    pub fn new() -> Self {
+        Self(TokenFlag::Owned(Arc::new(AtomicBool::new(false))))
+    }
+
+    /// A token over a process-wide flag. This is how the legacy
+    /// `MIDNIGHT_CANCEL` static participates; new callers want
+    /// [`new`](Self::new).
+    pub(crate) const fn shared(flag: &'static AtomicBool) -> Self {
+        Self(TokenFlag::Shared(flag))
+    }
+
+    /// Ask the proof holding this token to stop at its next checkpoint.
+    pub fn cancel(&self) {
+        self.flag().store(true, Ordering::Release);
+    }
+
+    /// Whether [`cancel`](Self::cancel) has been called.
+    pub fn is_cancelled(&self) -> bool {
+        self.flag().load(Ordering::Acquire)
+    }
+
+    fn flag(&self) -> &AtomicBool {
+        match &self.0 {
+            TokenFlag::Owned(a) => a,
+            TokenFlag::Shared(s) => s,
+        }
+    }
+}
+
+impl Default for CancelToken {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Everything a single proof needs to know about *how* to run, as distinct
+/// from *what* to prove: the memory policy and an optional cancellation token.
+///
+/// This is the value that makes two provers in one process able to differ.
+/// It is borrowed through key loading and proof creation, so it costs nothing
+/// per call, and every decision the prover makes about memory or cancellation
+/// is answered from it rather than from process state.
+///
+/// [`ProverContext::process`] is the compatibility bridge: the same policy
+/// the environment variables have always expressed, plus the process-wide
+/// cancel flag. Entry points that take no context use it, so existing callers
+/// see exactly the behaviour they had — except that cancellation is now an
+/// error, not a panic.
+#[derive(Clone, Debug, Default)]
+pub struct ProverContext {
+    /// How this proof trades memory for CPU and disk.
+    pub config: ProverConfig,
+    /// Set to let the caller stop this proof between phases. `None` means the
+    /// proof cannot be cancelled, which is the right default for a library
+    /// call that owns the whole computation.
+    pub cancel: Option<CancelToken>,
+}
+
+impl ProverContext {
+    /// A context with the given policy and no cancellation.
+    pub fn new(config: ProverConfig) -> Self {
+        Self {
+            config,
+            cancel: None,
+        }
+    }
+
+    /// Attach a cancellation token.
+    pub fn with_cancel(mut self, token: CancelToken) -> Self {
+        self.cancel = Some(token);
+        self
+    }
+
+    /// Whether cancellation has been requested for this proof.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.as_ref().is_some_and(CancelToken::is_cancelled)
+    }
+
+    /// The process-wide context: [`ProverConfig::process`] plus the legacy
+    /// `MIDNIGHT_CANCEL` flag as its token.
+    ///
+    /// This is what every context-free entry point uses, so callers that
+    /// never heard of a context keep the behaviour the environment variables
+    /// and the static flag gave them. The one deliberate change: a set flag
+    /// now yields [`Error::Cancelled`](crate::plonk::Error::Cancelled)
+    /// instead of a panic. Its `Display` still carries the old sentinel.
+    pub fn process() -> Self {
+        Self {
+            config: ProverConfig::process().clone(),
+            cancel: Some(CancelToken::shared(&crate::plonk::MIDNIGHT_CANCEL)),
+        }
     }
 }
 
@@ -270,5 +425,53 @@ mod test {
         // and would race every other test in this binary. Asserting the cache
         // holds is what can be checked without that.
         assert_eq!(ProverConfig::process(), ProverConfig::process());
+    }
+
+    #[test]
+    fn a_token_cancels_its_holder_and_nothing_else() {
+        let a = CancelToken::new();
+        let b = CancelToken::new();
+        let a_handle = a.clone();
+        assert!(!a.is_cancelled() && !b.is_cancelled());
+
+        a_handle.cancel();
+        assert!(a.is_cancelled(), "the clone shares the flag");
+        assert!(!b.is_cancelled(), "an unrelated token is untouched");
+
+        let ctx_a = ProverContext::new(ProverConfig::heap()).with_cancel(a);
+        let ctx_b = ProverContext::new(ProverConfig::heap()).with_cancel(b);
+        let ctx_none = ProverContext::new(ProverConfig::heap());
+        assert!(ctx_a.is_cancelled());
+        assert!(!ctx_b.is_cancelled());
+        assert!(!ctx_none.is_cancelled(), "no token means never cancelled");
+    }
+
+    #[test]
+    fn msm_chunk_never_overflows_the_shift() {
+        // F-025: the documented "disable" value 32 overflows a 32-bit usize,
+        // and 64 was accepted from the environment on 64-bit. Both now clamp
+        // to the largest representable power of two, which is "disabled".
+        for log2 in [usize::BITS - 1, usize::BITS, 64, 200, u32::MAX] {
+            let c = ProverConfig {
+                msm_chunk_log2: log2,
+                ..ProverConfig::heap()
+            };
+            assert_eq!(c.msm_chunk(), 1usize << (usize::BITS - 1), "log2={log2}");
+        }
+    }
+
+    #[test]
+    fn the_cancelled_error_still_carries_the_sentinel() {
+        // Hosts that predate the typed error recognised cancellation by this
+        // substring in a panic message. It must survive in the error's text.
+        let e = crate::plonk::Error::Cancelled {
+            phase: "trace.parse_advices.start",
+        };
+        let text = e.to_string();
+        assert!(
+            text.contains(crate::plonk::MIDNIGHT_CANCEL_SENTINEL),
+            "{text}"
+        );
+        assert!(text.contains("trace.parse_advices.start"), "{text}");
     }
 }

@@ -42,6 +42,19 @@ pub enum Error {
     /// Completeness failure due to bad luck in random sampling.
     /// This error is expected to be almost impossible to trigger.
     CompletenessFailure,
+    /// The caller cancelled this proof through its
+    /// [`CancelToken`](crate::config::CancelToken); `phase` names the
+    /// checkpoint at which the prover stopped.
+    ///
+    /// Cancellation is a normal outcome, not a fault: nothing was corrupted
+    /// and the same inputs can be proven again. The [`Display`](fmt::Display)
+    /// text contains `MIDNIGHT_CANCELLED_BY_HOST`, the sentinel the prover
+    /// used to *panic* with, so a host that still recognises cancellation by
+    /// that substring keeps working against the error message.
+    Cancelled {
+        /// The phase checkpoint at which cancellation was observed.
+        phase: &'static str,
+    },
 }
 
 impl From<io::Error> for Error {
@@ -85,6 +98,11 @@ impl fmt::Display for Error {
             Error::TableError(error) => write!(f, "{error}"),
             Error::SrsError(srs_k, circuit_k) => write!(f, "The SRS (with size {srs_k}) does not match for the given circuit (of size {circuit_k})"),
             Self::CompletenessFailure => write!(f, "Completeness failure due to bad luck in random sampling. This error is expected to be almost impossible to trigger."),
+            Error::Cancelled { phase } => write!(
+                f,
+                "{}: proof cancelled by the caller at phase {phase}",
+                super::prover::MIDNIGHT_CANCEL_SENTINEL
+            ),
         }
     }
 }

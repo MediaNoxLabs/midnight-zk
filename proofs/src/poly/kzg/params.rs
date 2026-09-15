@@ -22,8 +22,8 @@ use crate::{
 /// memory-constrained targets (mobile, wasm), `g_lagrange` is wrapped in
 /// `OnceLock`: callers can release it via
 /// [`drop_lazy_bases`](Self::drop_lazy_bases) between proofs and the next
-/// `commit_lagrange` (or other Lagrange-basis access via
-/// [`g_lagrange_slice`](Self::g_lagrange_slice)) will rebuild it from `g`.
+/// `commit_lagrange` (or other Lagrange-basis access via the crate-private
+/// `g_lagrange_slice`) will rebuild it from `g`.
 ///
 /// File-format compatibility is preserved: `read_custom` still consumes
 /// the `g_lagrange` bytes the writer produced and pre-populates the lock,
