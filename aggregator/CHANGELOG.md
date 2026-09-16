@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://book.async.rs/overview
 * truncated_challenges feature to allow --all-features compilation [#146](https://github.com/midnightntwrk/midnight-zk/pull/146)
 * Rebase to new `circuits/` with `keccak` and `blake2b` [#135](https://github.com/midnightntwrk/midnight-zk/pull/135)
 ### Changed
+* Follow the deterministic prover and `Instantiable::from_public_input` ported onto the 0.7.3 line:
+  `light_self_emulation` gains the (non-invertible, `unimplemented!`) `from_public_input` the
+  trait now requires, and the in-repo dependencies move to `midnight-proofs 0.7.1`,
+  `midnight-circuits 6.1.0`, `midnight-zk-stdlib 1.1.0`. No change to the aggregator's own
+  behaviour or public inputs.
 ### Removed
 * Halo2curves dependency [#139](https://github.com/midnightntwrk/midnight-zk/pull/139)
 
