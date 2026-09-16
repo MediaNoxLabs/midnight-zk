@@ -106,25 +106,33 @@ where
     }
 }
 
+/// The largest MSM the blstrs fast path may take, as a function of the target
+/// rather than of `cfg!` — so a test can assert both arms on one machine.
+///
+/// The numbers are measurements, not preferences: blstrs regresses above 2^18
+/// on x86, and keeps winning past 2^20 on aarch64. Writing them as shifts is
+/// how `2 << 18` — which is 2^19, not 2^18 — got past review once already, so
+/// `the_msm_fast_path_gate_is_the_measured_boundary` pins both arms against
+/// decimal literals.
+const fn fast_path_max(aarch64: bool) -> usize {
+    if aarch64 {
+        1 << 21
+    } else {
+        1 << 18
+    }
+}
+
 #[allow(unsafe_code)]
 /// Wrapper over the MSM function to use the blstrs underlying function
 pub fn msm_specific<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C::Curve]) -> C::Curve {
-    // We empirically checked that for MSMs larger than 2**18, the blstrs
-    // implementation regresses on x86.  On modern aarch64 (Apple M-series,
-    // A17/A18) the blstrs fast path keeps winning well past 2^20 because its
-    // hand-tuned Pippenger + threadpool dominate the generic `msm_best`, so
-    // there the gate is 2^21 and k=21 (n = 1 048 576 ≤ 2 097 152) stays on the
-    // fast path.  See docs/k21-plan.md (proposal 1).
-    //
-    // The gate is per-target because the measurement was: raising it
-    // everywhere would hand x86 the regression this comment records, for
-    // 2^18 < n ≤ 2^21, and would make the chunked-Pippenger arm below
-    // unreachable under 2^21 on every target.
-    const FAST_PATH_MAX: usize = if cfg!(target_arch = "aarch64") {
-        1 << 21
-    } else {
-        2 << 18
-    };
+    // Per target, because the measurement was: raising the gate everywhere
+    // would hand x86 the regression blstrs has above 2^18, and would make the
+    // chunked-Pippenger arm below unreachable under 2^21 everywhere. On
+    // aarch64 (Apple M-series, A17/A18) blstrs keeps winning past 2^20 —
+    // hand-tuned Pippenger plus its own threadpool — so k=21 stays on the
+    // fast path there. `fast_path_max` carries the numbers and the test that
+    // pins them; see also docs/k21-plan.md (proposal 1).
+    const FAST_PATH_MAX: usize = fast_path_max(cfg!(target_arch = "aarch64"));
     if coeffs.len() <= FAST_PATH_MAX
         && TypeId::of::<C>() == TypeId::of::<midnight_curves::G1Affine>()
     {
@@ -287,6 +295,26 @@ where
 
 #[cfg(test)]
 mod test {
+
+    use super::fast_path_max;
+
+    /// The gate is a measured boundary, so it is pinned against decimal
+    /// literals: `1 << 18` on both sides of an assertion proves nothing, and
+    /// the defect this guards against was exactly a shift off by one bit
+    /// (`2 << 18` = 524_288). F-043.
+    #[test]
+    fn the_msm_fast_path_gate_is_the_measured_boundary() {
+        assert_eq!(
+            fast_path_max(false),
+            262_144,
+            "x86 must gate at the measured 2^18, above which blstrs regresses"
+        );
+        assert_eq!(
+            fast_path_max(true),
+            2_097_152,
+            "aarch64 must gate at 2^21 so k=21 stays on the fast path"
+        );
+    }
     use ff::Field;
     use group::Group;
     use midnight_curves::{Fq, G1Affine, G1Projective};
