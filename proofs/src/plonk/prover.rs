@@ -7,6 +7,13 @@ use std::{
 
 use ff::{Field, FromUniformBytes, PrimeField, WithSmallOrderMulGroup};
 use rand_core::{CryptoRng, RngCore};
+// par_iter swap (k21 iter-3 / parallelism-doc P1): wrap the per-column
+// coset / lagrange_to_coeff loops in rayon so the column-level
+// parallelism complements the FFT-internal parallelism rayon already
+// does inside `best_fft`. Sequential `.iter().map(coeff_to_extended)`
+// loops are the reason the effective core-count was ~2 of 11 rayon
+// threads in pre-experiment measurements.
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 use super::{
     circuit::{
@@ -14,16 +21,19 @@ use super::{
         Advice, Any, Assignment, Challenge, Circuit, Column, ConstraintSystem, Fixed, FloorPlanner,
         Instance, Selector,
     },
+    cosets::{build_cosets, will_spill, Cosets},
     lookup, permutation, vanishing, Error, ProvingKey,
 };
 #[cfg(feature = "committed-instances")]
 use crate::poly::EvaluationDomain;
 use crate::{
     circuit::Value,
+    config::{ProverConfig, ProverContext},
     plonk::{traces::ProverTrace, trash},
     poly::{
-        batch_invert_rational, commitment::PolynomialCommitmentScheme, Coeff,
-        ExtendedLagrangeCoeff, LagrangeCoeff, Polynomial, PolynomialRepresentation, ProverQuery,
+        batch_invert_rational, commitment::PolynomialCommitmentScheme, polynomial_views, Coeff,
+        ExtendedLagrangeCoeff, LagrangeCoeff, Polynomial, PolynomialRepresentation, PolynomialView,
+        ProverQuery,
     },
     transcript::{Hashable, Sampleable, Transcript},
     utils::{arithmetic::eval_polynomial, rational::Rational},
@@ -54,6 +64,7 @@ where
 /// are zero-padded internally.
 ///
 /// The trace can then be used to finalise proofs, or to fold them.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn compute_trace<
     F,
     CS: PolynomialCommitmentScheme<F>,
@@ -68,8 +79,9 @@ pub(crate) fn compute_trace<
     // instances that the verifier receives in committed form.
     #[cfg(feature = "committed-instances")] nb_committed_instances: usize,
     instances: &[&[&[F]]],
-    mut rng: impl RngCore + CryptoRng,
+    rng: &mut (impl RngCore + CryptoRng),
     transcript: &mut T,
+    ctx: &ProverContext,
 ) -> Result<ProverTrace<F>, Error>
 where
     CS::Commitment: Hashable<T::Hash>,
@@ -100,18 +112,25 @@ where
 
     let domain = &pk.vk.domain;
 
+    checkpoint(ctx, "trace.compute_instances.start")?;
     let instance = compute_instances(params, pk, instances, nb_committed_instances, transcript)?;
+    checkpoint(ctx, "trace.compute_instances.end")?;
 
-    let (advice, challenges) =
-        parse_advices(params, pk, circuits, instances, transcript, &mut rng)?;
+    checkpoint(ctx, "trace.parse_advices.start")?;
+    let (advice, challenges) = parse_advices(params, pk, circuits, instances, transcript, rng)?;
+    checkpoint(ctx, "trace.parse_advices.end")?;
+    let fixed_value_views = pk.fixed_values_views();
 
     // Sample theta challenge for keeping lookup columns linearly independent
     let theta: F = transcript.squeeze_challenge();
 
+    checkpoint(ctx, "trace.lookups_permuted.start")?;
     let lookups: Vec<Vec<lookup::prover::Permuted<F>>> = instance
         .iter()
         .zip(advice.iter())
         .map(|(instance, advice)| -> Result<Vec<_>, Error> {
+            let advice_views = polynomial_views(&advice.advice_polys);
+            let instance_views = polynomial_views(&instance.instance_values);
             // Construct and commit to permuted values for each lookup
             pk.vk
                 .cs
@@ -123,11 +142,11 @@ where
                         params,
                         domain,
                         theta,
-                        &advice.advice_polys,
-                        &pk.fixed_values,
-                        &instance.instance_values,
+                        &advice_views,
+                        &fixed_value_views,
+                        &instance_views,
                         &challenges,
-                        &mut rng,
+                        rng,
                         transcript,
                     )
                 })
@@ -135,42 +154,51 @@ where
         })
         .collect::<Result<Vec<_>, _>>()?;
 
+    checkpoint(ctx, "trace.lookups_permuted.end")?;
+
     // Sample beta challenge
     let beta: F = transcript.squeeze_challenge();
 
     // Sample gamma challenge
     let gamma: F = transcript.squeeze_challenge();
 
+    checkpoint(ctx, "trace.permutations_commit.start")?;
     // Commit to permutations.
     let permutations: Vec<permutation::prover::Committed<F>> = instance
         .iter()
         .zip(advice.iter())
         .map(|(instance, advice)| {
+            let advice_views = polynomial_views(&advice.advice_polys);
+            let instance_views = polynomial_views(&instance.instance_values);
             pk.vk.cs.permutation.commit(
                 params,
                 pk,
                 &pk.permutation,
-                &advice.advice_polys,
-                &pk.fixed_values,
-                &instance.instance_values,
+                &advice_views,
+                &fixed_value_views,
+                &instance_views,
                 beta,
                 gamma,
-                &mut rng,
+                rng,
                 transcript,
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
 
+    checkpoint(ctx, "trace.permutations_commit.end")?;
+
+    checkpoint(ctx, "trace.lookups_product.start")?;
     let lookups: Vec<Vec<lookup::prover::Committed<F>>> = lookups
         .into_iter()
         .map(|lookups| -> Result<Vec<_>, _> {
             // Construct and commit to products for each lookup
             lookups
                 .into_iter()
-                .map(|lookup| lookup.commit_product(pk, params, beta, gamma, &mut rng, transcript))
+                .map(|lookup| lookup.commit_product(pk, params, beta, gamma, rng, transcript))
                 .collect::<Result<Vec<_>, _>>()
         })
         .collect::<Result<Vec<_>, _>>()?;
+    checkpoint(ctx, "trace.lookups_product.end")?;
 
     // Trash argument
     let trash_challenge: F = transcript.squeeze_challenge();
@@ -179,6 +207,8 @@ where
         .iter()
         .zip(advice.iter())
         .map(|(instance, advice)| -> Result<Vec<_>, Error> {
+            let advice_views = polynomial_views(&advice.advice_polys);
+            let instance_views = polynomial_views(&instance.instance_values);
             pk.vk
                 .cs
                 .trashcans
@@ -188,9 +218,9 @@ where
                         params,
                         domain,
                         trash_challenge,
-                        &advice.advice_polys,
-                        &pk.fixed_values,
-                        &instance.instance_values,
+                        &advice_views,
+                        &fixed_value_views,
+                        &instance_views,
                         &challenges,
                         transcript,
                     )
@@ -200,7 +230,7 @@ where
         .collect::<Result<Vec<_>, _>>()?;
 
     // Commit to the vanishing argument's random polynomial for blinding h(x_3)
-    let vanishing = vanishing::Argument::<F, CS>::commit(params, domain, &mut rng, transcript)?;
+    let vanishing = vanishing::Argument::<F, CS>::commit(params, domain, rng, transcript)?;
 
     // Obtain challenge for keeping all separate gates linearly independent
     let y: F = transcript.squeeze_challenge();
@@ -208,11 +238,18 @@ where
     let (instance_polys, instance_values) =
         instance.into_iter().map(|i| (i.instance_polys, i.instance_values)).unzip();
 
+    // par_iter (P1): the inner `lagrange_to_coeff` loop runs an iFFT
+    // per advice column. At k=20 there are ~30 columns and each iFFT
+    // is itself rayon-parallel — but the outer .into_iter() forced
+    // them to run sequentially, leaving rayon threads idle during the
+    // FFT's serial bit-reversal + twiddle prologue. into_par_iter()
+    // schedules columns across the pool so the prologue phases overlap.
+    // Outer is per-instance (usually 1); we keep .into_iter() there.
     let advice_polys = advice
         .into_iter()
         .map(|a| {
             a.advice_polys
-                .into_iter()
+                .into_par_iter()
                 .map(|p| domain.lagrange_to_coeff(p))
                 .collect::<Vec<_>>()
         })
@@ -240,6 +277,160 @@ where
 /// parameters `params` and the proving key [`ProvingKey`] that was
 /// generated previously for the same circuit. The provided `instances`
 /// are zero-padded internally.
+/// Sample `(VmRSS, VmHWM)` in KiB from `/proc/self/status`. Returns
+/// `None` on non-Linux/Android targets. Used by [`log_phase`] to
+/// emit per-phase memory snapshots through the `midnight_bench`
+/// tracing target — the dioxus-wallet `BenchStageLayer` captures
+/// these and renders them in the Benchmark tab stage pill, plus
+/// they appear as ordinary entries in the Logs tab.
+///
+/// Reading `/proc/self/status` is cheap (single syscall, ~few KiB
+/// of kernel text), so we can call this freely at phase boundaries
+/// without measurable wall-clock overhead.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn sample_rss_hwm_kb() -> Option<(u64, u64)> {
+    let s = std::fs::read_to_string("/proc/self/status").ok()?;
+    let mut rss: Option<u64> = None;
+    let mut hwm: Option<u64> = None;
+    for line in s.lines() {
+        if let Some(v) = line.strip_prefix("VmRSS:") {
+            rss = v.split_whitespace().next().and_then(|n| n.parse().ok());
+        } else if let Some(v) = line.strip_prefix("VmHWM:") {
+            hwm = v.split_whitespace().next().and_then(|n| n.parse().ok());
+        }
+    }
+    rss.zip(hwm)
+}
+
+/// macOS / iOS path. There's no `/proc`; use the libc-ish
+/// `mach_task_basic_info` via `getrusage(RUSAGE_SELF)`. Same
+/// `(rss_kb, peak_kb)` return shape so callers don't branch.
+/// We can't read crate-level deps cleanly here, so call libc
+/// directly via the link-shim that ships with the Rust runtime.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub(crate) fn sample_rss_hwm_kb() -> Option<(u64, u64)> {
+    // SAFETY: `getrusage` is async-signal-safe and pure-read; the
+    // `rusage` struct is zero-init then filled by the kernel.
+    #[allow(unsafe_code)]
+    unsafe {
+        extern "C" {
+            fn getrusage(who: i32, usage: *mut Rusage) -> i32;
+        }
+        #[repr(C)]
+        struct Timeval {
+            tv_sec: i64,
+            tv_usec: i32,
+        }
+        #[repr(C)]
+        struct Rusage {
+            ru_utime: Timeval,
+            ru_stime: Timeval,
+            ru_maxrss: i64, // bytes on macOS
+            ru_ixrss: i64,
+            ru_idrss: i64,
+            ru_isrss: i64,
+            ru_minflt: i64,
+            ru_majflt: i64,
+            ru_nswap: i64,
+            ru_inblock: i64,
+            ru_oublock: i64,
+            ru_msgsnd: i64,
+            ru_msgrcv: i64,
+            ru_nsignals: i64,
+            ru_nvcsw: i64,
+            ru_nivcsw: i64,
+        }
+        let mut u: Rusage = std::mem::zeroed();
+        if getrusage(0 /* RUSAGE_SELF */, &mut u) != 0 {
+            return None;
+        }
+        // macOS reports `ru_maxrss` in bytes. Convert to KiB to
+        // match the Linux semantics. We don't have a true "current
+        // RSS" — `ru_maxrss` is the high-water mark — so report it
+        // as both rss and hwm; callers see them tracking the same.
+        let hwm_kb = (u.ru_maxrss as u64) / 1024;
+        Some((hwm_kb, hwm_kb))
+    }
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+)))]
+pub(crate) fn sample_rss_hwm_kb() -> Option<(u64, u64)> {
+    None
+}
+
+/// The process-wide cancellation flag, kept for callers that predate
+/// per-request tokens.
+///
+/// It is the token behind [`ProverContext::process`], which is what every
+/// context-free entry point uses: a host that sets this flag still stops the
+/// prover at its next phase boundary. What changed is the outcome — the prover
+/// now returns [`Error::Cancelled`] rather than panicking, and the error's
+/// message carries [`MIDNIGHT_CANCEL_SENTINEL`] so a host that recognised
+/// cancellation by that substring keeps doing so.
+///
+/// Because it is process-wide, it cancels *every* proof that is using the
+/// process context — which is exactly why new callers should hold a
+/// [`CancelToken`](crate::config::CancelToken) of their own through
+/// [`create_proof_with`] instead. The host remains responsible for resetting
+/// the flag before its next proof; a token needs no reset.
+pub static MIDNIGHT_CANCEL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The substring hosts have matched to recognise cancellation. It used to be
+/// the panic message; it is now part of [`Error::Cancelled`]'s `Display`.
+pub const MIDNIGHT_CANCEL_SENTINEL: &str = "MIDNIGHT_CANCELLED_BY_HOST";
+
+/// Consult the context at a phase boundary: emit the phase marker, then stop
+/// with [`Error::Cancelled`] if this proof's token has been set.
+///
+/// Every phase boundary in the prover goes through here, so cancellation lands
+/// within one phase — around 30 boundaries per proof — and only for the proof
+/// whose context this is. Key generation has no context and no checkpoint;
+/// nothing can cancel it.
+pub(crate) fn checkpoint(ctx: &ProverContext, name: &'static str) -> Result<(), Error> {
+    log_phase(name);
+    if ctx.is_cancelled() {
+        return Err(Error::Cancelled { phase: name });
+    }
+    Ok(())
+}
+
+/// Emit a phase-marker tracing event. Captured by both
+/// `WalletLogLayer` (→ Logs tab + redb persistence) and
+/// `BenchStageLayer` (→ live stage pill on the Benchmark tab).
+/// `rss_mb` is the live resident set size at the moment of the
+/// call; `hwm_mb` is the high-water mark across the process
+/// lifetime so far. Together they show which phase is responsible
+/// for each step-up in peak memory.
+///
+/// Purely observational. Cancellation is [`checkpoint`]'s job, so a marker
+/// emitted from inside a closure that cannot return an error stays a marker.
+fn log_phase(name: &'static str) {
+    if let Some((rss_kb, hwm_kb)) = sample_rss_hwm_kb() {
+        tracing::info!(
+            target: "midnight_bench",
+            stage = name,
+            rss_mb = rss_kb / 1024,
+            hwm_mb = hwm_kb / 1024,
+        );
+    } else {
+        tracing::info!(target: "midnight_bench", stage = name);
+    }
+}
+
+/// `log_phase` exposed for `keygen.rs` (sibling module under `plonk`)
+/// without changing visibility on the underlying helpers. Same
+/// behaviour; same low-cost `/proc/self/status` read.
+#[doc(hidden)]
+pub(crate) fn log_phase_pub(name: &'static str) {
+    log_phase(name)
+}
+
 pub(crate) fn finalise_proof<'a, F, CS: PolynomialCommitmentScheme<F>, T: Transcript>(
     params: &'a CS::Parameters,
     pk: &'a ProvingKey<F, CS>,
@@ -248,7 +439,9 @@ pub(crate) fn finalise_proof<'a, F, CS: PolynomialCommitmentScheme<F>, T: Transc
     // instances that the verifier receives in committed form.
     #[cfg(feature = "committed-instances")] nb_committed_instances: usize,
     trace: ProverTrace<F>,
+    rng: &mut (impl RngCore + CryptoRng),
     transcript: &mut T,
+    ctx: &ProverContext,
 ) -> Result<(), Error>
 where
     CS::Commitment: Hashable<T::Hash>,
@@ -264,7 +457,9 @@ where
 
     let domain = pk.get_vk().get_domain();
 
-    let h_poly = compute_h_poly(pk, &trace);
+    checkpoint(ctx, "finalise.compute_h_poly.start")?;
+    let h_poly = compute_h_poly(pk, &trace, &ctx.config);
+    checkpoint(ctx, "finalise.compute_h_poly.end")?;
 
     let ProverTrace {
         advice_polys,
@@ -277,7 +472,9 @@ where
     } = trace;
 
     // Construct the vanishing argument's h(X) commitments
-    let vanishing = vanishing.construct::<CS, T>(params, domain, h_poly, transcript)?;
+    checkpoint(ctx, "finalise.vanishing_construct.start")?;
+    let vanishing = vanishing.construct::<CS, T>(params, domain, h_poly, rng, transcript)?;
+    checkpoint(ctx, "finalise.vanishing_construct.end")?;
 
     let x: F = transcript.squeeze_challenge();
 
@@ -293,7 +490,8 @@ where
     let vanishing = vanishing.evaluate(x, domain, transcript)?;
 
     // Evaluate common permutation data
-    pk.permutation.evaluate(x, transcript)?;
+    let permutation_polys = pk.permutation_polys_views();
+    pk.permutation.evaluate(&permutation_polys, x, transcript)?;
 
     // Evaluate the permutations, if any, at omega^i x.
     let permutations: Vec<permutation::prover::Evaluated<F>> = permutations
@@ -323,6 +521,7 @@ where
         })
         .collect::<Result<Vec<_>, _>>()?;
 
+    checkpoint(ctx, "finalise.compute_queries.start")?;
     let queries = compute_queries(
         pk,
         nb_committed_instances,
@@ -334,14 +533,22 @@ where
         &vanishing,
         x,
     );
-
-    CS::multi_open(params, &queries, transcript).map_err(|_| Error::ConstraintSystemFailure)
+    checkpoint(ctx, "finalise.multi_open.start")?;
+    let res =
+        CS::multi_open(params, &queries, transcript).map_err(|_| Error::ConstraintSystemFailure);
+    checkpoint(ctx, "finalise.multi_open.end")?;
+    res
 }
 
 /// This creates a proof for the provided `circuit` when given the public
 /// parameters `params` and the proving key [`ProvingKey`] that was
 /// generated previously for the same circuit. The provided `instances`
 /// are zero-padded internally.
+///
+/// Runs under the process-wide [`ProverContext::process`]: the memory policy
+/// the environment variables describe, and the [`MIDNIGHT_CANCEL`] flag as
+/// its cancellation token. Callers that need a policy or a token of their own
+/// use [`create_proof_with`]; this is that function with the process context.
 //
 // NOTE: Any change here must be mirrored in src/plonk/bench/prover.rs
 // to ensure the benchmarks remain aligned with the real prover.
@@ -368,7 +575,8 @@ where
         + Ord
         + FromUniformBytes<64>,
 {
-    let trace = compute_trace(
+    create_proof_with(
+        &ProverContext::process(),
         params,
         pk,
         circuits,
@@ -377,15 +585,68 @@ where
         instances,
         rng,
         transcript,
+    )
+}
+
+/// [`create_proof`] with an explicit [`ProverContext`]: this proof's memory
+/// policy and, optionally, a cancellation token that stops *this proof only*.
+///
+/// The context is borrowed for the duration of the call. Two proofs in one
+/// process may hold different contexts — one on the heap, one spilling — and
+/// cancelling one through its token leaves the other, and any key generation,
+/// untouched. Cancellation surfaces as [`Error::Cancelled`] at the next phase
+/// boundary; nothing is left half-written.
+#[allow(clippy::too_many_arguments)]
+pub fn create_proof_with<
+    F,
+    CS: PolynomialCommitmentScheme<F>,
+    T: Transcript,
+    ConcreteCircuit: Circuit<F>,
+>(
+    ctx: &ProverContext,
+    params: &CS::Parameters,
+    pk: &ProvingKey<F, CS>,
+    circuits: &[ConcreteCircuit],
+    #[cfg(feature = "committed-instances")] nb_committed_instances: usize,
+    instances: &[&[&[F]]],
+    mut rng: impl RngCore + CryptoRng,
+    transcript: &mut T,
+) -> Result<(), Error>
+where
+    CS::Commitment: Hashable<T::Hash>,
+    F: WithSmallOrderMulGroup<3>
+        + Sampleable<T::Hash>
+        + Hashable<T::Hash>
+        + Hash
+        + Ord
+        + FromUniformBytes<64>,
+{
+    checkpoint(ctx, "create_proof.compute_trace.start")?;
+    let trace = compute_trace(
+        params,
+        pk,
+        circuits,
+        #[cfg(feature = "committed-instances")]
+        nb_committed_instances,
+        instances,
+        &mut rng,
+        transcript,
+        ctx,
     )?;
-    finalise_proof(
+    checkpoint(ctx, "create_proof.compute_trace.end")?;
+    checkpoint(ctx, "create_proof.finalise_proof.start")?;
+    let res = finalise_proof(
         params,
         pk,
         #[cfg(feature = "committed-instances")]
         nb_committed_instances,
         trace,
+        &mut rng,
         transcript,
-    )
+        ctx,
+    );
+    checkpoint(ctx, "create_proof.finalise_proof.end")?;
+    res
 }
 
 pub(super) fn compute_instances<F, CS, T>(
@@ -462,7 +723,7 @@ pub(super) fn parse_advices<F, CS, ConcreteCircuit, T>(
     circuits: &[ConcreteCircuit],
     instances: &[&[&[F]]],
     transcript: &mut T,
-    mut rng: impl RngCore + CryptoRng,
+    rng: &mut (impl RngCore + CryptoRng),
 ) -> Result<(Vec<AdviceSingle<F, LagrangeCoeff>>, Vec<F>), Error>
 where
     F: WithSmallOrderMulGroup<3> + Sampleable<T::Hash>,
@@ -554,7 +815,7 @@ where
             for (column_index, advice_values) in column_indices.iter().zip(&mut advice_values) {
                 if !witness.unblinded_advice.contains(column_index) {
                     for cell in &mut advice_values[unusable_rows_start..] {
-                        *cell = F::random(&mut rng);
+                        *cell = F::random(&mut *rng);
                     }
                 } else {
                     #[cfg(debug_assertions)]
@@ -594,6 +855,7 @@ where
 pub(super) fn compute_h_poly<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitmentScheme<F>>(
     pk: &ProvingKey<F, CS>,
     trace: &ProverTrace<F>,
+    config: &ProverConfig,
 ) -> Polynomial<F, ExtendedLagrangeCoeff> {
     let ProverTrace {
         advice_polys,
@@ -609,33 +871,163 @@ pub(super) fn compute_h_poly<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitm
         y,
         ..
     } = &trace;
-    // Calculate the advice and instance cosets
-    let advice_cosets: Vec<Vec<Polynomial<F, ExtendedLagrangeCoeff>>> = advice_polys
+
+    // ── streaming-iteration-3 S1 ──
+    // The advice + instance per-instance coset arrays are the single
+    // biggest unspilled allocation in `finalise_proof`. At k=21 with
+    // ~30 advice cols + extended_factor=8 the eager Vec<Vec<Polynomial>>
+    // is ~7.7 GiB coresident — directly responsible for the bulk of the
+    // pre-S1 phys_footprint we measured (8.3 GiB iOS sim, commit
+    // 7b6f7a5). Same env-var gating as fixed/perm cosets:
+    // `MIDNIGHT_SPILL_COSETS=1` + `MIDNIGHT_SPILL_FLOOR_K` (default 18).
+    //
+    // Spill path: each instance's advice (or instance) polys go through
+    // `spill_cosets_to_disk` → a `SpilledCosets<F>` that holds an mmap
+    // arc and `Polynomial` views into the mapped pages. Drop of the
+    // whole `Vec<CosetsForInstance>` cleans the tempfile up.
+    //
+    // In-memory path stays the default for hosts with abundant RAM
+    // (and for low-k where the spill IO overhead isn't worth it).
+    // `build_cosets` owns both the spill decision and the two arms, so
+    // these call sites carry no `cfg` and read no environment of their
+    // own. `will_spill` is asked only to narrate the choice: it answers
+    // for the capability as well as the switch, so a phase marker never
+    // reports a spill that the build could not have performed.
+    let k = pk.vk.domain.k();
+    let narrate_spill = will_spill(k, config);
+
+    // Calculate the advice and instance cosets.
+    let advice_cosets: Vec<Cosets<F>> = advice_polys
         .iter()
         .map(|advice_polys| {
-            advice_polys
-                .iter()
-                .map(|poly| pk.vk.get_domain().coeff_to_extended(poly.clone()))
-                .collect()
+            if narrate_spill {
+                log_phase("finalise.compute_h_poly.spill_advice_cosets.start");
+            }
+            let c = build_cosets(advice_polys, k, config, |poly| {
+                pk.vk.get_domain().coeff_to_extended(poly.materialise())
+            });
+            if narrate_spill {
+                log_phase("finalise.compute_h_poly.spill_advice_cosets.end");
+            }
+            c
         })
         .collect();
-    let instance_cosets: Vec<Vec<Polynomial<F, ExtendedLagrangeCoeff>>> = instance_polys
+    let instance_cosets: Vec<Cosets<F>> = instance_polys
         .iter()
         .map(|instance_polys| {
-            instance_polys
-                .iter()
-                .map(|poly| pk.vk.get_domain().coeff_to_extended(poly.clone()))
-                .collect()
+            if narrate_spill {
+                log_phase("finalise.compute_h_poly.spill_instance_cosets.start");
+            }
+            let c = build_cosets(instance_polys, k, config, |poly| {
+                pk.vk.get_domain().coeff_to_extended(poly.materialise())
+            });
+            if narrate_spill {
+                log_phase("finalise.compute_h_poly.spill_instance_cosets.end");
+            }
+            c
         })
         .collect();
 
+    // Materialise the fixed + permutation cosets right before
+    // `evaluate_h`. Two paths:
+    //
+    // - `MIDNIGHT_SPILL_COSETS=1` — disk-backed: build each coset one at a time,
+    //   write to a tempfile, drop before the next. Mmap the result. Peak in-memory
+    //   transient per column. Required for k ≥ 20 on phones where the full
+    //   `Vec<Polynomial>` (~6+ GiB at k=20) can't fit alongside the existing prove
+    //   working set.
+    //
+    // - default — in-memory `.collect()`: faster (~1 disk write pass saved) but
+    //   holds all cosets coresident. Fine through k=19 on mobile, dies at k=20.
+    //
+    // Forward-compat: if the ProvingKey carries a pre-built
+    // cached `fixed_cosets` / `permutation.cosets` (from an older
+    // eager-keygen path or a deserialised PK), use it as-is.
+    // Only spill at high `k`. At small `k` the entire coset
+    // collection fits comfortably in heap; round-tripping through
+    // a tempfile is pure overhead (measured: +46–47 % prove
+    // time at k=16/17 on a Samsung S24 Ultra when the wallet
+    // unconditionally set `MIDNIGHT_SPILL_COSETS=1`). The
+    // mobile wallet sets the env var at process start regardless
+    // of `k`; the cheap fix is to gate the spill on `k` here so
+    // small-k proves keep their in-memory fast path.
+    //
+    // Override the floor with `MIDNIGHT_SPILL_FLOOR_K`. Set to
+    // `0` to spill at every `k` (useful for testing the spill
+    // path directly).
+    //
+    // S1 (iteration 3): the spill_floor_k / want_spill computation
+    // also drives the advice/instance cosets spill earlier in this
+    // function. Reuse `want_spill_advice` here as the shared spill
+    // gate so all four coset categories (fixed/perm/advice/instance)
+    // follow the same env-var contract.
+    let built_fixed_cosets = if !pk.fixed_cosets.is_empty() {
+        None
+    } else {
+        // S5 (P2): read through `fixed_polys_views()` so the
+        // mmap-backed sidecar is consulted first when engaged.
+        // `build_cosets` picks the arm; the marker names stay split
+        // so downstream consumers that match on them see the same
+        // strings for the same behaviour as before.
+        log_phase(if narrate_spill {
+            "finalise.compute_h_poly.spill_fixed_cosets.start"
+        } else {
+            "finalise.compute_h_poly.materialise_fixed_cosets.start"
+        });
+        let fixed_polys = pk.fixed_polys_views();
+        let built = build_cosets(&fixed_polys, k, config, |p| {
+            pk.vk.domain.coeff_to_extended(p.materialise())
+        });
+        log_phase(if narrate_spill {
+            "finalise.compute_h_poly.spill_fixed_cosets.end"
+        } else {
+            "finalise.compute_h_poly.materialise_fixed_cosets.end"
+        });
+        Some(built)
+    };
+    let fixed_cosets = match &built_fixed_cosets {
+        Some(cosets) => cosets.views(),
+        None => polynomial_views(&pk.fixed_cosets),
+    };
+
+    let built_perm_cosets = if !pk.permutation.cosets.is_empty() {
+        None
+    } else {
+        // Reads through `permutation_polys_views()` so the S5-P3
+        // mmap-backed sidecar is consulted first.
+        log_phase(if narrate_spill {
+            "finalise.compute_h_poly.spill_perm_cosets.start"
+        } else {
+            "finalise.compute_h_poly.materialise_perm_cosets.start"
+        });
+        let permutation_polys = pk.permutation_polys_views();
+        let built = build_cosets(&permutation_polys, k, config, |p| {
+            pk.vk.domain.coeff_to_extended(p.materialise())
+        });
+        log_phase(if narrate_spill {
+            "finalise.compute_h_poly.spill_perm_cosets.end"
+        } else {
+            "finalise.compute_h_poly.materialise_perm_cosets.end"
+        });
+        Some(built)
+    };
+    let permutation_cosets = match &built_perm_cosets {
+        Some(cosets) => cosets.views(),
+        None => polynomial_views(&pk.permutation.cosets),
+    };
+
+    let advice_coset_views: Vec<Vec<_>> = advice_cosets.iter().map(Cosets::views).collect();
+    let advice_coset_slices: Vec<&[_]> = advice_coset_views.iter().map(Vec::as_slice).collect();
+    let instance_coset_views: Vec<Vec<_>> = instance_cosets.iter().map(Cosets::views).collect();
+    let instance_coset_slices: Vec<&[_]> = instance_coset_views.iter().map(Vec::as_slice).collect();
+
     // Evaluate the h(X) polynomial
-    pk.ev.evaluate_h::<ExtendedLagrangeCoeff>(
+    let h_poly = pk.ev.evaluate_h::<ExtendedLagrangeCoeff>(
         &pk.vk.domain,
         &pk.vk.cs,
-        &advice_cosets.iter().map(|a| a.as_slice()).collect::<Vec<_>>(),
-        &instance_cosets.iter().map(|i| i.as_slice()).collect::<Vec<_>>(),
-        &pk.fixed_cosets,
+        &advice_coset_slices,
+        &instance_coset_slices,
+        &fixed_cosets,
         challenges,
         *y,
         *beta,
@@ -645,11 +1037,16 @@ pub(super) fn compute_h_poly<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitm
         lookups,
         trashcans,
         permutations,
-        &pk.l0,
-        &pk.l_last,
-        &pk.l_active_row,
-        &pk.permutation.cosets,
-    )
+        PolynomialView::new(&pk.l0),
+        PolynomialView::new(&pk.l_last),
+        PolynomialView::new(&pk.l_active_row),
+        &permutation_cosets,
+    );
+    // `computed_fixed_cosets` / `computed_perm_cosets` (if we built
+    // them) drop here — releasing both extended-domain expansions
+    // before vanishing.construct and multi_open run.
+    log_phase("finalise.compute_h_poly.drop_cosets.end");
+    h_poly
 }
 
 pub(super) fn write_evals_to_transcript<F, CS, T>(
@@ -697,11 +1094,12 @@ where
     }
 
     // Compute and hash fixed evals (shared across all circuit instances)
+    let fixed_polys = pk.fixed_polys_views();
     let fixed_evals: Vec<_> = meta
         .fixed_queries
         .iter()
         .map(|&(column, at)| {
-            eval_polynomial(&pk.fixed_polys[column.index()], domain.rotate_omega(x, at))
+            eval_polynomial(&fixed_polys[column.index()][..], domain.rotate_omega(x, at))
         })
         .collect();
 
@@ -730,6 +1128,8 @@ pub(super) fn compute_queries<
     x: F,
 ) -> Vec<ProverQuery<'a, F>> {
     let domain = pk.vk.get_domain();
+    let fixed_polys = pk.fixed_polys_views();
+    let permutation_polys = pk.permutation_polys_views();
     instance_polys
         .iter()
         .zip(advice_polys.iter())
@@ -742,33 +1142,27 @@ pub(super) fn compute_queries<
                     .chain(
                         pk.vk.cs.instance_queries.iter().filter_map(move |&(column, at)| {
                             if column.index() < nb_committed_instances {
-                                Some(ProverQuery {
-                                    point: domain.rotate_omega(x, at),
-                                    poly: &instance[column.index()],
-                                })
+                                Some(ProverQuery::new(
+                                    domain.rotate_omega(x, at),
+                                    &instance[column.index()],
+                                ))
                             } else {
                                 None
                             }
                         }),
                     )
-                    .chain(
-                        pk.vk.cs.advice_queries.iter().map(move |&(column, at)| ProverQuery {
-                            point: domain.rotate_omega(x, at),
-                            poly: &advice[column.index()],
-                        }),
-                    )
+                    .chain(pk.vk.cs.advice_queries.iter().map(move |&(column, at)| {
+                        ProverQuery::new(domain.rotate_omega(x, at), &advice[column.index()])
+                    }))
                     .chain(permutation.open(pk, x))
                     .chain(lookups.iter().flat_map(move |p| p.open(pk, x)))
                     .chain(trash.iter().flat_map(move |p| p.open(x)))
             },
         )
-        .chain(
-            pk.vk.cs.fixed_queries.iter().map(move |&(column, at)| ProverQuery {
-                point: domain.rotate_omega(x, at),
-                poly: &pk.fixed_polys[column.index()],
-            }),
-        )
-        .chain(pk.permutation.open(x))
+        .chain(pk.vk.cs.fixed_queries.iter().map(|&(column, at)| {
+            ProverQuery::from_view(domain.rotate_omega(x, at), fixed_polys[column.index()])
+        }))
+        .chain(permutation_polys.iter().copied().map(|poly| ProverQuery::from_view(x, poly)))
         // We query the h(X) polynomial at x
         .chain(vanishing.open(x))
         .collect::<Vec<_>>()
@@ -963,12 +1357,26 @@ fn test_create_proof() {
 
     const K: u32 = 4;
     let params: ParamsKZG<Bn256> = ParamsKZG::unsafe_setup(K, OsRng);
-    let vk = keygen_vk_with_k(&params, &MyCircuit, K).expect("keygen_vk should not fail");
-    let pk = keygen_pk(vk, &MyCircuit).expect("keygen_pk should not fail");
+    let vk = keygen_vk_with_k::<Fr, KZGCommitmentScheme<Bn256>, _>(&params, &MyCircuit, K)
+        .expect("keygen_vk should not fail");
+    #[cfg_attr(not(feature = "disk-spill"), allow(unused_mut))]
+    let mut pk = keygen_pk(vk, &MyCircuit).expect("keygen_pk should not fail");
+    #[cfg(feature = "disk-spill")]
+    {
+        use crate::utils::SerdeFormat;
+
+        let expected = pk.to_bytes(SerdeFormat::RawBytesUnchecked);
+        pk.spill_all_to_mmap(&ProverConfig::heap()).expect("PK spill should not fail");
+        assert_eq!(
+            pk.to_bytes(SerdeFormat::RawBytesUnchecked),
+            expected,
+            "spilling storage must not change PK serialization"
+        );
+    }
     let mut transcript = CircuitTranscript::<_>::init();
 
     // Create proof with wrong number of instances
-    let proof = create_proof::<Fr, KZGCommitmentScheme<Bn256>, _, _>(
+    let proof = create_proof(
         &params,
         &pk,
         &[MyCircuit, MyCircuit],
@@ -981,7 +1389,7 @@ fn test_create_proof() {
     assert!(matches!(proof.unwrap_err(), Error::InvalidInstances));
 
     // Create proof with correct number of instances
-    create_proof::<Fr, KZGCommitmentScheme<Bn256>, _, _>(
+    create_proof(
         &params,
         &pk,
         &[MyCircuit, MyCircuit],

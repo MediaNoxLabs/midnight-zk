@@ -142,14 +142,26 @@ pub(crate) struct ProvingKey<F: PrimeField> {
 impl<F: WithSmallOrderMulGroup<3> + SerdeObject> ProvingKey<F> {
     /// Reads proving key for a single permutation argument from buffer using
     /// `Polynomial::read`.
+    ///
+    /// `defer_cosets` leaves `cosets` empty for the prover to rebuild lazily —
+    /// see `ProvingKey::read_with_policy` for why the decision has to be made
+    /// here rather than by clearing them afterwards.
     pub(super) fn read<R: io::Read>(
         reader: &mut R,
         format: SerdeFormat,
         domain: &EvaluationDomain<F>,
         p: &Argument,
+        defer_cosets: bool,
     ) -> io::Result<Self> {
         let permutations = read_polynomial_vec(reader, format)?;
-        let (polys, cosets) = compute_polys_and_cosets::<F>(domain, p, &permutations);
+        let (polys, cosets) = if defer_cosets {
+            (
+                keygen::compute_polys::<F>(domain, p, &permutations),
+                Vec::new(),
+            )
+        } else {
+            compute_polys_and_cosets::<F>(domain, p, &permutations)
+        };
         Ok(ProvingKey {
             permutations,
             polys,

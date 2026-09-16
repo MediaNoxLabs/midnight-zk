@@ -17,6 +17,23 @@ verification keys break backwards compatibility.
 
 ### Removed
 
+## [6.3.0]
+### Fixed
+* Fix `VectorGadget::padding_flag` soundness bug for short vectors whose payload starts in the last chunk. This changes the verification key of circuits that use vector or base64 gadgets. [#481](https://github.com/midnightntwrk/midnight-zk/pull/481)
+
+## [6.2.1]
+### Fixed
+* Bug fix in midnight-curves [#433](https://github.com/midnightntwrk/midnight-zk/pull/433)
+
+## [6.2.0]
+### Added
+* `EccChip::scalar_from_reduced_le_bytes`: convert little-endian bytes to a scalar bounded to `NUM_BITS_SUBGROUP` bits [#407](https://github.com/midnightntwrk/midnight-zk/pull/407)
+* `Instantiable::from_public_input`: inverse of `as_public_input` for decoding values from their public input representation [#407](https://github.com/midnightntwrk/midnight-zk/pull/407)
+
+## [6.1.0]
+### Changed
+* `ForeignEccChip::new` samples the windowed-MSM blinding point at construction time [#307](https://github.com/midnightntwrk/midnight-zk/pull/307)
+
 ## [6.0.0] - 18-12-2025
 ### Added
 * SHA512 chip [#96](https://github.com/midnightntwrk/midnight-zk/pull/96)

@@ -106,22 +106,99 @@ where
     }
 }
 
+/// The largest MSM the blstrs fast path may take, as a function of the target
+/// rather than of `cfg!` — so a test can assert both arms on one machine.
+///
+/// The numbers are measurements, not preferences: blstrs regresses above 2^18
+/// on x86, and keeps winning past 2^20 on aarch64. Writing them as shifts is
+/// how `2 << 18` — which is 2^19, not 2^18 — got past review once already, so
+/// `the_msm_fast_path_gate_is_the_measured_boundary` pins both arms against
+/// decimal literals.
+const fn fast_path_max(aarch64: bool) -> usize {
+    if aarch64 {
+        1 << 21
+    } else {
+        1 << 18
+    }
+}
+
 #[allow(unsafe_code)]
 /// Wrapper over the MSM function to use the blstrs underlying function
 pub fn msm_specific<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C::Curve]) -> C::Curve {
-    // We empirically checked that for MSMs larger than 2**18, the blstrs
-    // implementation regresses.
-    if coeffs.len() <= (2 << 18) && TypeId::of::<C>() == TypeId::of::<midnight_curves::G1Affine>() {
+    // Per target, because the measurement was: raising the gate everywhere
+    // would hand x86 the regression blstrs has above 2^18, and would make the
+    // chunked-Pippenger arm below unreachable under 2^21 everywhere. On
+    // aarch64 (Apple M-series, A17/A18) blstrs keeps winning past 2^20 —
+    // hand-tuned Pippenger plus its own threadpool — so k=21 stays on the
+    // fast path there. `fast_path_max` carries the numbers and the test that
+    // pins them; see also docs/k21-plan.md (proposal 1).
+    const FAST_PATH_MAX: usize = fast_path_max(cfg!(target_arch = "aarch64"));
+    if coeffs.len() <= FAST_PATH_MAX
+        && TypeId::of::<C>() == TypeId::of::<midnight_curves::G1Affine>()
+    {
         // Safe: we just checked type
         let coeffs = unsafe { &*(coeffs as *const _ as *const [Fq]) };
         let bases = unsafe { &*(bases as *const _ as *const [G1Projective]) };
         let res = G1Projective::multi_exp(bases, coeffs);
         unsafe { std::mem::transmute_copy(&res) }
     } else {
+        // S3 (k21-iter-3): chunked-Pippenger fallback. The default
+        // path allocates `affine_bases: Vec<C> = vec![identity; n]`
+        // (192 MiB at n=2^21, 384 MiB at n=2^22) and then `msm_best`
+        // internally allocates another `bases_local: Vec<Affine<F>>`
+        // of the same size — at k=22 that's 768 MiB per MSM call.
+        //
+        // Pippenger composes naturally over chunks: split coeffs/bases
+        // into fixed-size chunks, run msm_best on each, sum the
+        // partial G1Projective results. Per-chunk peak heap drops to
+        // ~24 MiB (256K bases × 96 B) regardless of total n. Trade:
+        // a few % more CPU because msm_best's window size `c` is
+        // chosen per-chunk and a smaller `c` does more total windows.
+        //
+        // Override the chunk size with `MIDNIGHT_MSM_CHUNK_LOG2` (an
+        // integer; final chunk size = `1 << that`). Set to a large
+        // value (e.g. 32) to disable chunking entirely.
+        msm_chunked::<C>(coeffs, bases, msm_chunk_size())
+    }
+}
+
+/// Chunk size for the Pippenger fallback, read from the environment.
+///
+/// Split from [`msm_chunked`] deliberately, for the same reason
+/// `plonk::cosets::spill_decision` is split from `should_spill_cosets`:
+/// mutating process environment inside a test is `unsafe` under Rust 2024 and
+/// races with every other test in the binary. Keeping the mechanism reachable
+/// without going through the variable is what makes it testable at all.
+fn msm_chunk_size() -> usize {
+    crate::config::ProverConfig::process().msm_chunk()
+}
+
+/// Pippenger over fixed-size chunks, summing the partial results.
+///
+/// Chunking is a pure restructuring of the same sum: Pippenger composes over
+/// any partition of the input, so the result must equal the unchunked one for
+/// every `chunk`. That is a property worth asserting rather than assuming —
+/// this sits on the `commit_lagrange` path, and an optimisation that quietly
+/// changed a commitment would still pass every other test in the suite.
+/// `chunked_msm_agrees_with_unchunked` in this module's tests is that
+/// assertion. Named in prose rather than linked: it is `#[cfg(test)]`, so a
+/// doc build cannot resolve a link to it.
+fn msm_chunked<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C::Curve], chunk: usize) -> C::Curve {
+    if coeffs.len() <= chunk {
         let mut affine_bases = vec![C::identity(); coeffs.len()];
         C::Curve::batch_normalize(bases, &mut affine_bases);
-        msm_best(coeffs, &affine_bases)
+        return msm_best(coeffs, &affine_bases);
     }
+
+    let mut acc = C::Curve::identity();
+    for (c_chunk, b_chunk) in coeffs.chunks(chunk).zip(bases.chunks(chunk)) {
+        let mut affine_chunk = vec![C::identity(); c_chunk.len()];
+        C::Curve::batch_normalize(b_chunk, &mut affine_chunk);
+        acc += msm_best(c_chunk, &affine_chunk);
+        // affine_chunk + msm_best's bases_local drop here, freeing
+        // ~48 MiB before the next iteration allocates.
+    }
+    acc
 }
 
 /// Two channel MSM accumulator
@@ -177,7 +254,7 @@ where
     }
 
     /// Split the [DualMSM] into `left` and `right`
-    pub fn split(&self) -> SplitDualMSM<E> {
+    pub fn split(&self) -> SplitDualMSM<'_, E> {
         let left = self.left.scalars.iter().zip(self.left.bases.iter()).collect();
         let right = self.right.scalars.iter().zip(self.right.bases.iter()).collect();
         (left, right)
@@ -213,5 +290,112 @@ where
         let terms = &[term_1, term_2];
 
         bool::from(E::multi_miller_loop(&terms[..]).final_exponentiation().is_identity())
+    }
+}
+
+#[cfg(test)]
+mod test {
+
+    use super::fast_path_max;
+
+    /// The gate is a measured boundary, so it is pinned against decimal
+    /// literals: `1 << 18` on both sides of an assertion proves nothing, and
+    /// the defect this guards against was exactly a shift off by one bit
+    /// (`2 << 18` = 524_288). F-043.
+    #[test]
+    fn the_msm_fast_path_gate_is_the_measured_boundary() {
+        assert_eq!(
+            fast_path_max(false),
+            262_144,
+            "x86 must gate at the measured 2^18, above which blstrs regresses"
+        );
+        assert_eq!(
+            fast_path_max(true),
+            2_097_152,
+            "aarch64 must gate at 2^21 so k=21 stays on the fast path"
+        );
+    }
+    use ff::Field;
+    use group::Group;
+    use midnight_curves::{Fq, G1Affine, G1Projective};
+    use rand_core::OsRng;
+
+    use super::{msm_chunk_size, msm_chunked};
+
+    /// Chunking must not change the answer.
+    ///
+    /// `msm_chunked` splits the input, runs Pippenger per chunk and sums the
+    /// partials. That is only valid because the sum is associative over any
+    /// partition — so the same inputs must give the same point for every
+    /// chunk size, including sizes that do not divide the length evenly.
+    ///
+    /// Without this the optimisation could change a commitment and every
+    /// other test in the suite would still pass, because nothing else
+    /// compares the two arms. The same gap was found and closed for the
+    /// coset spill (`plonk::cosets::spilled_and_heap_cosets_agree`); this
+    /// is its counterpart on the MSM path.
+    #[test]
+    fn chunked_msm_agrees_with_unchunked() {
+        const N: usize = 64;
+
+        let coeffs: Vec<Fq> = (0..N).map(|_| Fq::random(OsRng)).collect();
+        let bases: Vec<G1Projective> = (0..N).map(|_| G1Projective::random(OsRng)).collect();
+
+        // `chunk >= N` takes the single-shot arm: the reference answer.
+        let reference = msm_chunked::<G1Affine>(&coeffs, &bases, N);
+
+        // Sizes chosen to cover the cases the loop can get wrong: a divisor,
+        // a non-divisor leaving a short final chunk, one larger than the
+        // input, and the degenerate chunk of one.
+        for chunk in [1usize, 3, 7, 8, 16, N - 1, N, N + 1, 4096] {
+            let got = msm_chunked::<G1Affine>(&coeffs, &bases, chunk);
+            assert_eq!(
+                got, reference,
+                "chunked MSM disagreed with the unchunked result at chunk={chunk}"
+            );
+        }
+    }
+
+    /// Zero coefficients must not shift the result.
+    ///
+    /// On this line `msm_specific` passes the caller's slices straight
+    /// through — unlike 0.8, which filters zero scalars first and so
+    /// repartitions before chunking. The property is worth asserting on both:
+    /// a zero coefficient must contribute nothing regardless of which chunk
+    /// it lands in.
+    #[test]
+    fn chunked_msm_is_indifferent_to_zero_coefficients() {
+        const N: usize = 32;
+
+        let mut coeffs: Vec<Fq> = (0..N).map(|_| Fq::random(OsRng)).collect();
+        let bases: Vec<G1Projective> = (0..N).map(|_| G1Projective::random(OsRng)).collect();
+        for (i, c) in coeffs.iter_mut().enumerate() {
+            if i % 3 == 0 {
+                *c = Fq::ZERO;
+            }
+        }
+
+        let reference = msm_chunked::<G1Affine>(&coeffs, &bases, N);
+        for chunk in [1usize, 5, 16] {
+            assert_eq!(
+                msm_chunked::<G1Affine>(&coeffs, &bases, chunk),
+                reference,
+                "zero coefficients changed the result at chunk={chunk}"
+            );
+        }
+    }
+
+    /// The chunk size comes from the policy, so it can be asserted directly
+    /// rather than guarded on whether someone's shell happens to set a
+    /// variable. `config::test::msm_chunk_is_two_to_the_log` covers the
+    /// default and the arithmetic.
+    #[test]
+    fn chunk_size_comes_from_the_policy() {
+        use crate::config::{ProverConfig, DEFAULT_MSM_CHUNK_LOG2};
+        assert_eq!(
+            ProverConfig::heap().msm_chunk(),
+            1 << DEFAULT_MSM_CHUNK_LOG2
+        );
+        assert_eq!(msm_chunk_size(), ProverConfig::process().msm_chunk());
     }
 }

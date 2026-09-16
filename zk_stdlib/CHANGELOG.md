@@ -17,7 +17,23 @@ verification keys break backwards compatibility.
 
 ### Removed
 
-## 1.0.0 
+## [1.3.0]
+### Fixed
+* Bump `midnight-circuits` to 6.3.0 and `midnight-proofs` to 0.7.3, pulling in the `padding_flag` soundness fix. This changes the verification key of circuits that use vector or base64 gadgets. [#481](https://github.com/midnightntwrk/midnight-zk/pull/481)
+
+## [1.2.1]
+### Fixed
+* Bug fix in midnight-curves [#433](https://github.com/midnightntwrk/midnight-zk/pull/433)
+
+## [1.2.0]
+### Added
+* `Instantiable::from_public_input`: inverse of `as_public_input` for decoding values from their public input representation [#407](https://github.com/midnightntwrk/midnight-zk/pull/407)
+
+## [1.1.0]
+### Changed
+* Update `prove` to accept `impl RngCore + CryptoRng` by value [#307](https://github.com/midnightntwrk/midnight-zk/pull/307)
+
+## [1.0.0] 
 ### Added
 - Initial release of zk_stdlib extracted from circuits crate
 

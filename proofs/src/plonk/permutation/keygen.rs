@@ -118,8 +118,9 @@ impl Assembly {
         self,
         domain: &EvaluationDomain<F>,
         p: &Argument,
+        defer_cosets: bool,
     ) -> ProvingKey<F> {
-        build_pk::<_>(domain, p, |i, j| self.mapping[i][j])
+        build_pk::<_>(domain, p, defer_cosets, |i, j| self.mapping[i][j])
     }
 
     /// Returns columns that participate in the permutation argument.
@@ -138,6 +139,7 @@ impl Assembly {
 pub(crate) fn build_pk<F: WithSmallOrderMulGroup<3>>(
     domain: &EvaluationDomain<F>,
     p: &Argument,
+    defer_cosets: bool,
     mapping: impl Fn(usize, usize) -> (usize, usize) + Sync,
 ) -> ProvingKey<F> {
     // Compute [omega^0, omega^1, ..., omega^{params.n - 1}]
@@ -182,7 +184,24 @@ pub(crate) fn build_pk<F: WithSmallOrderMulGroup<3>>(
         });
     }
 
-    let (polys, cosets) = compute_polys_and_cosets::<F>(domain, p, &permutations);
+    // `defer_cosets` mirrors `permutation::ProvingKey::read`: under a policy
+    // that maps the prover key, the extended-domain cosets are not built here
+    // at all — they are only consumed inside `compute_h_poly::evaluate_h`, and
+    // the prover materialises them lazily through `build_cosets`, which is the
+    // path that can spill them. That saves `~n_cols × 4n × 32 B` of
+    // keygen-resident heap (hundreds of MiB at k=20) and, more importantly,
+    // is what makes the spill reachable at all.
+    //
+    // Under the default heap policy they are built here, exactly as a
+    // deserialised key builds them, so a key from `keygen_pk` and a key from
+    // `ProvingKey::read` prove at the same speed. Deferring unconditionally
+    // made every prove from a freshly generated key pay an extended FFT per
+    // column, on a policy whose documented meaning is "upstream's behaviour".
+    let (polys, cosets) = if defer_cosets {
+        (compute_polys::<F>(domain, p, &permutations), Vec::new())
+    } else {
+        compute_polys_and_cosets::<F>(domain, p, &permutations)
+    };
 
     ProvingKey {
         permutations,
@@ -250,6 +269,31 @@ pub(crate) fn build_vk<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitmentSch
     VerifyingKey { commitments }
 }
 
+/// The coefficient-form polynomials alone, without their extended-domain
+/// cosets.
+///
+/// Used when the caller intends to spill: building the cosets here would put
+/// `4n` per column on the heap at load time, before any policy could move them,
+/// which is the peak the spill exists to avoid. The prover rebuilds them lazily
+/// through `build_cosets` — the path that can spill them — when the cached
+/// collection is empty.
+pub(crate) fn compute_polys<F: WithSmallOrderMulGroup<3>>(
+    domain: &EvaluationDomain<F>,
+    p: &Argument,
+    permutations: &[Polynomial<F, LagrangeCoeff>],
+) -> Vec<Polynomial<F, Coeff>> {
+    let mut polys = vec![domain.empty_coeff(); p.columns.len()];
+    parallelize(&mut polys, |o, start| {
+        for (x, poly) in o.iter_mut().enumerate() {
+            let i = start + x;
+            *poly = domain.lagrange_to_coeff(permutations[i].clone());
+        }
+    });
+    polys
+}
+
+// Inserting `compute_polys` above this function earlier moved this attribute
+// onto the wrong item — the same detachment class as the drifting doc comments.
 #[allow(clippy::type_complexity)]
 pub(crate) fn compute_polys_and_cosets<F: WithSmallOrderMulGroup<3>>(
     domain: &EvaluationDomain<F>,

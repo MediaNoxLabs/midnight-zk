@@ -5,7 +5,7 @@ use crate::{
     plonk::evaluation::evaluate,
     poly::{
         commitment::PolynomialCommitmentScheme, Coeff, EvaluationDomain, LagrangeCoeff, Polynomial,
-        ProverQuery,
+        PolynomialView, ProverQuery,
     },
     transcript::{Hashable, Transcript},
     utils::arithmetic::eval_polynomial,
@@ -26,9 +26,9 @@ impl<F: WithSmallOrderMulGroup<3> + Ord> Argument<F> {
         params: &'params CS::Parameters,
         domain: &EvaluationDomain<F>,
         trash_challenge: F,
-        advice_values: &'a [Polynomial<F, LagrangeCoeff>],
-        fixed_values: &'a [Polynomial<F, LagrangeCoeff>],
-        instance_values: &'a [Polynomial<F, LagrangeCoeff>],
+        advice_values: &'a [PolynomialView<'a, F, LagrangeCoeff>],
+        fixed_values: &'a [PolynomialView<'a, F, LagrangeCoeff>],
+        instance_values: &'a [PolynomialView<'a, F, LagrangeCoeff>],
         challenges: &'a [F],
         transcript: &mut T,
     ) -> Result<Committed<F>, Error>
@@ -81,10 +81,6 @@ impl<F: WithSmallOrderMulGroup<3>> Committed<F> {
 
 impl<F: WithSmallOrderMulGroup<3>> Evaluated<F> {
     pub(crate) fn open(&self, x: F) -> impl Iterator<Item = ProverQuery<'_, F>> + Clone {
-        vec![ProverQuery {
-            point: x,
-            poly: &self.0.trash_poly,
-        }]
-        .into_iter()
+        vec![ProverQuery::new(x, &self.0.trash_poly)].into_iter()
     }
 }

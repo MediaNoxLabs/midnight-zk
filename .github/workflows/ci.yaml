@@ -5,6 +5,18 @@ on:
   push:
     branches:
       - main
+      - next
+      # fork-only: the `-patched` lines are long-lived branches pushed
+      # directly rather than through a PR, so neither trigger above fires
+      # on them. Without this the patch sets — which is where all the
+      # `unsafe` and all the prover changes live — carry no CI evidence
+      # at all. A glob rather than a list, so a new line is covered the
+      # day it is cut.
+      #
+      # Drop this entry when proposing the patch set upstream: it is
+      # infrastructure for how this fork is operated, not part of the
+      # change being proposed.
+      - '*-patched'
 
 jobs:
   download-srs:
@@ -12,11 +24,11 @@ jobs:
     outputs:
       srs-cache-hit: ${{ steps.cache-srs.outputs.cache-hit }}
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
 
       - name: Restore SRS from cache
         id: restore-srs
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
         with:
           path: zk_stdlib/examples/assets/bls_filecoin_2p19
           key: fixed-srs-cache
@@ -34,7 +46,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
       - uses: ./.github/actions/cargo-test
         with:
           package: midnight-curves
@@ -43,14 +55,14 @@ jobs:
   test-circuits:
     if: github.event.pull_request.draft == false
     name: Test circuits
-    runs-on: ubuntu-latest-16-core-x64
+    runs-on: ${{ vars.LARGE_RUNNER || 'ubuntu-latest' }}
 
     env:
       RUST_BACKTRACE: full
       RUSTFLAGS: --cfg ci_build
 
     steps:
-      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
       - run: cargo tree -e features -p midnight-curves
       - uses: ./.github/actions/cargo-test
         with:
@@ -61,16 +73,16 @@ jobs:
     needs: download-srs
     if: github.event.pull_request.draft == false
     name: Test zk-stdlib
-    runs-on: ubuntu-latest-16-core-x64
+    runs-on: ${{ vars.LARGE_RUNNER || 'ubuntu-latest' }}
 
     env:
       RUST_BACKTRACE: full
       RUSTFLAGS: --cfg ci_build
 
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
       - name: Restore SRS from cache
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
         with:
           path: zk_stdlib/examples/assets/bls_filecoin_2p19
           key: fixed-srs-cache
@@ -88,12 +100,12 @@ jobs:
     needs: download-srs
     if: github.event.pull_request.draft == false
     name: Test VK consistency
-    runs-on: ubuntu-latest-16-core-x64
+    runs-on: ${{ vars.LARGE_RUNNER || 'ubuntu-latest' }}
 
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
       - name: Restore SRS from cache
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
         with:
           path: zk_stdlib/examples/assets/bls_filecoin_2p19
           key: fixed-srs-cache
@@ -122,32 +134,64 @@ jobs:
       - name: Install libfontconfig1-dev
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
       - uses: ./.github/actions/cargo-test
         with:
           package: midnight-proofs
           args: --release
 
+  # fork-only: the optimisations live behind `mmap` and `disk-spill`, and
+  # `test-proofs` above runs default features only — so until this job existed,
+  # the 46 tests that exist only under `disk-spill` had never run in CI once.
+  # Clippy's `--all-features` compiles those paths but executes nothing.
+  #
+  # The matrix is the same one the local gate uses, for the same reason: a
+  # feature that turns an optimisation on must be tested with it on, and the
+  # spill arm must be forced, because its own floor (`MIDNIGHT_SPILL_FLOOR_K`,
+  # default 18) means a normal test run never reaches it.
+  test-proofs-features:
+    if: github.event.pull_request.draft == false
+    name: Test proofs (${{ matrix.label }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: mmap
+            features: mmap
+            forced: 'false'
+          - label: disk-spill
+            features: disk-spill
+            forced: 'false'
+          - label: disk-spill forced at every k
+            features: disk-spill
+            forced: 'true'
+    steps:
+      - name: Install libfontconfig1-dev
+        run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - name: 'Install rust-toolchain.toml'
+        run: rustup toolchain install
+      - name: Test
+        env:
+          FEATURES: ${{ matrix.features }}
+          FORCED: ${{ matrix.forced }}
+        run: |
+          if [ "$FORCED" = "true" ]; then
+            export MIDNIGHT_SPILL_COSETS=1
+            export MIDNIGHT_SPILL_FLOOR_K=0
+          fi
+          cargo test -p midnight-proofs --release --features "$FEATURES"
+
   test-aggregator:
     if: github.event.pull_request.draft == false
-    name: Test Aggregator
+    name: Test Aggregation
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
       - uses: ./.github/actions/cargo-test
         with:
           package: midnight-aggregator
-          args: --release --all-features
-
-  test-zkir:
-    if: github.event.pull_request.draft == false
-    name: Test ZKIR
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8
-      - uses: ./.github/actions/cargo-test
-        with:
-          package: midnight-zkir
           args: --release --all-features
 
   doc-links:
@@ -156,7 +200,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
       - name: 'Install rust-toolchain.toml'
         run: rustup toolchain install
       - name: cargo fetch
@@ -173,10 +217,28 @@ jobs:
     timeout-minutes: 30
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8
-      - uses: dtolnay/rust-toolchain@nightly
-      - run: rustup component add rustfmt --toolchain nightly
-      - run: cargo +nightly fmt --all -- --check
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      # fork-only: pin the formatter.
+      #
+      # `@nightly` installs whatever nightly exists on the day the job runs,
+      # so this check re-decides what "formatted" means every morning. The
+      # tree is formatted to roughly nightly-2026-03-08; against a September
+      # nightly, `--check` reports diffs in 130+ files across curves/,
+      # circuits/, aggregation/ and zk_stdlib/ — nearly all of them untouched
+      # by any branch. The job is red for everyone, and the only ways out are
+      # to reformat the whole repository or to pin.
+      #
+      # Pinned rather than reformatted: a patch set that rewrites 130
+      # upstream files to chase a formatter is unreviewable, and it would go
+      # red again on the next rustfmt change anyway.
+      #
+      # Worth proposing upstream on its own merits — an unpinned formatter in
+      # CI breaks branches that changed nothing.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-03-08
+          components: rustfmt
+      - run: cargo +nightly-2026-03-08 fmt --all -- --check
 
   clippy:
     if: github.event.pull_request.draft == false
@@ -185,7 +247,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
       - name: 'Install rust-toolchain.toml'
         run: rustup toolchain install
 

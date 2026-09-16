@@ -4,7 +4,7 @@ use group::ff::Field;
 use super::{ConstraintSystem, Expression};
 use crate::{
     plonk::{lookup, permutation, trash, Any},
-    poly::{EvaluationDomain, Polynomial, PolynomialRepresentation, Rotation},
+    poly::{EvaluationDomain, Polynomial, PolynomialRepresentation, PolynomialView, Rotation},
     utils::arithmetic::parallelize,
 };
 
@@ -56,9 +56,9 @@ impl ValueSource {
         rotations: &[usize],
         constants: &[F],
         intermediates: &[F],
-        fixed_values: &[Polynomial<F, B>],
-        advice_values: &[Polynomial<F, B>],
-        instance_values: &[Polynomial<F, B>],
+        fixed_values: &[PolynomialView<'_, F, B>],
+        advice_values: &[PolynomialView<'_, F, B>],
+        instance_values: &[PolynomialView<'_, F, B>],
         challenges: &[F],
         beta: &F,
         gamma: &F,
@@ -119,9 +119,9 @@ impl Calculation {
         rotations: &[usize],
         constants: &[F],
         intermediates: &[F],
-        fixed_values: &[Polynomial<F, B>],
-        advice_values: &[Polynomial<F, B>],
-        instance_values: &[Polynomial<F, B>],
+        fixed_values: &[PolynomialView<'_, F, B>],
+        advice_values: &[PolynomialView<'_, F, B>],
+        instance_values: &[PolynomialView<'_, F, B>],
         challenges: &[F],
         beta: &F,
         gamma: &F,
@@ -285,9 +285,9 @@ impl<F: WithSmallOrderMulGroup<3>> Evaluator<F> {
         &self,
         domain: &EvaluationDomain<F>,
         cs: &ConstraintSystem<F>,
-        advice: &[&[Polynomial<F, B>]],
-        instance: &[&[Polynomial<F, B>]],
-        fixed: &[Polynomial<F, B>],
+        advice: &[&[PolynomialView<'_, F, B>]],
+        instance: &[&[PolynomialView<'_, F, B>]],
+        fixed: &[PolynomialView<'_, F, B>],
         challenges: &[F],
         y: F,
         beta: F,
@@ -297,10 +297,10 @@ impl<F: WithSmallOrderMulGroup<3>> Evaluator<F> {
         lookups: &[Vec<lookup::prover::Committed<F>>],
         trashcans: &[Vec<trash::prover::Committed<F>>],
         permutations: &[permutation::prover::Committed<F>],
-        l0: &Polynomial<F, B>,
-        l_last: &Polynomial<F, B>,
-        l_active_row: &Polynomial<F, B>,
-        permutation_pk_cosets: &[Polynomial<F, B>],
+        l0: PolynomialView<'_, F, B>,
+        l_last: PolynomialView<'_, F, B>,
+        l_active_row: PolynomialView<'_, F, B>,
+        permutation_pk_cosets: &[PolynomialView<'_, F, B>],
     ) -> Polynomial<F, B> {
         let size = B::len(domain);
         let rot_scale = 1 << (B::k(domain) - domain.k());
@@ -731,9 +731,9 @@ impl<F: PrimeField> GraphEvaluator<F> {
     pub fn evaluate<B: PolynomialRepresentation>(
         &self,
         data: &mut EvaluationData<F>,
-        fixed: &[Polynomial<F, B>],
-        advice: &[Polynomial<F, B>],
-        instance: &[Polynomial<F, B>],
+        fixed: &[PolynomialView<'_, F, B>],
+        advice: &[PolynomialView<'_, F, B>],
+        instance: &[PolynomialView<'_, F, B>],
         challenges: &[F],
         beta: &F,
         gamma: &F,
@@ -783,9 +783,9 @@ pub fn evaluate<F: Field, B: PolynomialRepresentation>(
     expression: &Expression<F>,
     size: usize,
     rot_scale: i32,
-    fixed: &[Polynomial<F, B>],
-    advice: &[Polynomial<F, B>],
-    instance: &[Polynomial<F, B>],
+    fixed: &[PolynomialView<'_, F, B>],
+    advice: &[PolynomialView<'_, F, B>],
+    instance: &[PolynomialView<'_, F, B>],
     challenges: &[F],
 ) -> Vec<F> {
     let mut values = vec![F::ZERO; size];

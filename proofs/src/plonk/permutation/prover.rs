@@ -2,14 +2,14 @@ use std::iter::{self, ExactSizeIterator};
 
 use ff::{PrimeField, WithSmallOrderMulGroup};
 use group::ff::BatchInvert;
-use rand_core::RngCore;
+use rand_core::{CryptoRng, RngCore};
 
 use super::{super::circuit::Any, Argument, ProvingKey};
 use crate::{
     plonk::{self, Error},
     poly::{
-        commitment::PolynomialCommitmentScheme, Coeff, LagrangeCoeff, Polynomial, ProverQuery,
-        Rotation,
+        commitment::PolynomialCommitmentScheme, Coeff, LagrangeCoeff, Polynomial, PolynomialView,
+        ProverQuery, Rotation,
     },
     transcript::{Hashable, Transcript},
     utils::arithmetic::{eval_polynomial, parallelize},
@@ -36,19 +36,18 @@ impl Argument {
     pub(crate) fn commit<
         F: WithSmallOrderMulGroup<3>,
         CS: PolynomialCommitmentScheme<F>,
-        R: RngCore,
         T: Transcript,
     >(
         &self,
         params: &CS::Parameters,
         pk: &plonk::ProvingKey<F, CS>,
         pkey: &ProvingKey<F>,
-        advice: &[Polynomial<F, LagrangeCoeff>],
-        fixed: &[Polynomial<F, LagrangeCoeff>],
-        instance: &[Polynomial<F, LagrangeCoeff>],
+        advice: &[PolynomialView<'_, F, LagrangeCoeff>],
+        fixed: &[PolynomialView<'_, F, LagrangeCoeff>],
+        instance: &[PolynomialView<'_, F, LagrangeCoeff>],
         beta: F,
         gamma: F,
-        mut rng: R,
+        rng: &mut (impl RngCore + CryptoRng),
         transcript: &mut T,
     ) -> Result<Committed<F>, Error>
     where
@@ -149,7 +148,7 @@ impl Argument {
             let mut z = domain.lagrange_from_vec(z);
             // Set blinding factors
             for z in &mut z[domain.n as usize - blinding_factors..] {
-                *z = F::random(&mut rng);
+                *z = F::random(&mut *rng);
             }
             // Set new last_z
             last_z = z[domain.n as usize - (blinding_factors + 1)];
@@ -170,16 +169,17 @@ impl Argument {
 }
 
 impl<F: PrimeField> super::ProvingKey<F> {
-    pub(crate) fn open(&self, x: F) -> impl Iterator<Item = ProverQuery<'_, F>> + Clone {
-        self.polys.iter().map(move |poly| ProverQuery { point: x, poly })
-    }
-
-    pub(crate) fn evaluate<T: Transcript>(&self, x: F, transcript: &mut T) -> Result<(), Error>
+    pub(crate) fn evaluate<T: Transcript>(
+        &self,
+        polys: &[PolynomialView<'_, F, Coeff>],
+        x: F,
+        transcript: &mut T,
+    ) -> Result<(), Error>
     where
         F: Hashable<T::Hash>,
     {
         // Hash permutation evals
-        for eval in self.polys.iter().map(|poly| eval_polynomial(poly, x)) {
+        for eval in polys.iter().map(|poly| eval_polynomial(&poly[..], x)) {
             transcript.write(&eval)?;
         }
 
@@ -251,24 +251,18 @@ impl<F: WithSmallOrderMulGroup<3>> Evaluated<F> {
             .chain(self.constructed.sets.iter().flat_map(move |set| {
                 iter::empty()
                     // Open permutation product commitments at x and \omega x
-                    .chain(Some(ProverQuery {
-                        point: x,
-                        poly: &set.permutation_product_poly,
-                    }))
-                    .chain(Some(ProverQuery {
-                        point: x_next,
-                        poly: &set.permutation_product_poly,
-                    }))
+                    .chain(Some(ProverQuery::new(x, &set.permutation_product_poly)))
+                    .chain(Some(ProverQuery::new(
+                        x_next,
+                        &set.permutation_product_poly,
+                    )))
             }))
             // Open it at \omega^{last} x for all but the last set. This rotation is only
             // sensical for the first row, but we only use this rotation in a constraint
             // that is gated on l_0.
             .chain(
                 self.constructed.sets.iter().rev().skip(1).flat_map(move |set| {
-                    Some(ProverQuery {
-                        point: x_last,
-                        poly: &set.permutation_product_poly,
-                    })
+                    Some(ProverQuery::new(x_last, &set.permutation_product_poly))
                 }),
             )
     }

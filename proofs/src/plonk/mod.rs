@@ -10,8 +10,8 @@ use group::ff::FromUniformBytes;
 
 use crate::{
     poly::{
-        Coeff, EvaluationDomain, ExtendedLagrangeCoeff, LagrangeCoeff, PinnedEvaluationDomain,
-        Polynomial,
+        polynomial_views, Coeff, EvaluationDomain, ExtendedLagrangeCoeff, LagrangeCoeff,
+        PinnedEvaluationDomain, Polynomial, PolynomialView,
     },
     transcript::{Hashable, Transcript},
     utils::{
@@ -24,10 +24,16 @@ use crate::{
 };
 
 mod circuit;
+/// Coset construction, spilling to disk when built to.
+pub(crate) mod cosets;
 mod error;
 pub(crate) mod evaluation;
 mod keygen;
 pub(crate) mod lookup;
+// Mmap-backed proving-key and proof-time spill infrastructure. It needs both a
+// filesystem to write to and `mmap(2)` to read from.
+#[cfg(feature = "disk-spill")]
+pub(crate) mod mmap_pk;
 pub mod permutation;
 pub(crate) mod traces;
 pub(crate) mod trash;
@@ -341,6 +347,197 @@ pub struct ProvingKey<F: PrimeField, CS: PolynomialCommitmentScheme<F>> {
     pub(crate) fixed_cosets: Vec<Polynomial<F, ExtendedLagrangeCoeff>>,
     pub(crate) permutation: permutation::ProvingKey<F>,
     pub(crate) ev: Evaluator<F>,
+    /// Optional mmap-backed view of `fixed_polys`. When
+    /// `Some`, the corresponding `fixed_polys` Vec above is empty
+    /// and callers MUST read polynomials through
+    /// [`ProvingKey::fixed_polys_views`]. Wrapped in `Arc` so PK
+    /// `clone()` shares the underlying mmap + tempfile.
+    #[cfg(feature = "disk-spill")]
+    pub(crate) fixed_polys_mmap: Option<std::sync::Arc<mmap_pk::MmappedPolys<F, Coeff>>>,
+
+    /// Optional mmap-backed view of `fixed_values`. Same semantics as
+    /// `fixed_polys_mmap`. Read via [`ProvingKey::fixed_values_views`].
+    #[cfg(feature = "disk-spill")]
+    pub(crate) fixed_values_mmap: Option<std::sync::Arc<mmap_pk::MmappedPolys<F, LagrangeCoeff>>>,
+
+    /// Optional mmap-backed view of `permutation.polys`. Same semantics as
+    /// `fixed_polys_mmap`. Read via
+    /// [`ProvingKey::permutation_polys_views`]. Lives at the
+    /// top-level PK rather than inside `permutation::ProvingKey`
+    /// to keep the permutation type clone-safe and small.
+    #[cfg(feature = "disk-spill")]
+    pub(crate) permutation_polys_mmap: Option<std::sync::Arc<mmap_pk::MmappedPolys<F, Coeff>>>,
+}
+
+// Bound-free impl so the accessors and spill operations are available
+// from every code path that holds a `ProvingKey<F, CS>` — including
+// the `prover::create_proof` path which doesn't constrain
+// `F: FromUniformBytes<64>`.
+
+/// Bench-only: print the high-water mark after a stage of `read_with_policy`.
+///
+/// The HWM is monotonic, which is exactly what is wanted here — the stage at
+/// which it jumps is the stage that set the peak. Deltas are against the
+/// previous sample so the output reads as a per-stage attribution.
+#[cfg(feature = "bench-internal")]
+fn read_stage(name: &str, prev_hwm_kb: &mut u64) {
+    if let Some((rss_kb, hwm_kb)) = crate::plonk::prover::sample_rss_hwm_kb() {
+        let delta = hwm_kb.saturating_sub(*prev_hwm_kb);
+        eprintln!(
+            "read-stage {name:<28} rss={:>6} MiB  hwm={:>6} MiB  hwm_delta=+{:>5} MiB",
+            rss_kb >> 10,
+            hwm_kb >> 10,
+            delta >> 10
+        );
+        *prev_hwm_kb = hwm_kb;
+    }
+}
+#[cfg(not(feature = "bench-internal"))]
+#[inline(always)]
+fn read_stage(_name: &str, _prev: &mut u64) {}
+
+impl<F: PrimeField, CS: PolynomialCommitmentScheme<F>> ProvingKey<F, CS> {
+    /// Read `fixed_polys` through a single accessor so the
+    /// in-place mmap-backed sidecar can transparently replace the
+    /// heap `Vec` when engaged.
+    ///
+    /// When `fixed_polys_mmap` is `Some`, the heap `fixed_polys`
+    /// vector is empty and the polynomials live in mmap'd file
+    /// pages. When `None`, the legacy heap vector is returned.
+    /// Callers that previously indexed `&pk.fixed_polys[i]` should
+    /// now normalise once with `pk.fixed_polys_views()`.
+    pub(crate) fn fixed_polys_views(&self) -> Vec<PolynomialView<'_, F, Coeff>> {
+        #[cfg(feature = "disk-spill")]
+        if let Some(m) = self.fixed_polys_mmap.as_ref() {
+            return m.views();
+        }
+        polynomial_views(&self.fixed_polys)
+    }
+
+    /// Mirror of `fixed_polys_views` for `fixed_values`.
+    pub(crate) fn fixed_values_views(&self) -> Vec<PolynomialView<'_, F, LagrangeCoeff>> {
+        #[cfg(feature = "disk-spill")]
+        if let Some(m) = self.fixed_values_mmap.as_ref() {
+            return m.views();
+        }
+        polynomial_views(&self.fixed_values)
+    }
+
+    /// Mirror of `fixed_polys_views` for `permutation.polys`.
+    pub(crate) fn permutation_polys_views(&self) -> Vec<PolynomialView<'_, F, Coeff>> {
+        #[cfg(feature = "disk-spill")]
+        if let Some(m) = self.permutation_polys_mmap.as_ref() {
+            return m.views();
+        }
+        polynomial_views(&self.permutation.polys)
+    }
+
+    /// Move `fixed_polys` into mmap-backed storage.
+    /// See [`Self::spill_all_to_mmap`] for a one-shot variant that
+    /// also handles `fixed_values` and `permutation.polys`.
+    #[cfg(feature = "disk-spill")]
+    pub(crate) fn spill_fixed_polys_to_mmap(
+        &mut self,
+        config: &crate::config::ProverConfig,
+    ) -> std::io::Result<()> {
+        if self.fixed_polys_mmap.is_some() {
+            return Ok(());
+        }
+        if self.fixed_polys.is_empty() {
+            return Ok(());
+        }
+        let n_per_poly = self.fixed_polys[0].values.len();
+        let polys = std::mem::take(&mut self.fixed_polys);
+        let mm = mmap_pk::spill_vec_to_disk(config.spill_dir.as_deref(), polys, n_per_poly)?;
+        self.fixed_polys_mmap = Some(std::sync::Arc::new(mm));
+        Ok(())
+    }
+
+    /// Move `fixed_values` (LagrangeCoeff basis) into
+    /// mmap-backed storage. Mirrors `spill_fixed_polys_to_mmap`.
+    #[cfg(feature = "disk-spill")]
+    pub(crate) fn spill_fixed_values_to_mmap(
+        &mut self,
+        config: &crate::config::ProverConfig,
+    ) -> std::io::Result<()> {
+        if self.fixed_values_mmap.is_some() {
+            return Ok(());
+        }
+        if self.fixed_values.is_empty() {
+            return Ok(());
+        }
+        let n_per_poly = self.fixed_values[0].values.len();
+        let polys = std::mem::take(&mut self.fixed_values);
+        let mm = mmap_pk::spill_vec_to_disk(config.spill_dir.as_deref(), polys, n_per_poly)?;
+        self.fixed_values_mmap = Some(std::sync::Arc::new(mm));
+        Ok(())
+    }
+
+    /// Move `permutation.polys` (Coeff basis) into
+    /// mmap-backed storage. Sidecar lives at the top-level PK so
+    /// `permutation::ProvingKey` stays clone-safe and small.
+    #[cfg(feature = "disk-spill")]
+    pub(crate) fn spill_permutation_polys_to_mmap(
+        &mut self,
+        config: &crate::config::ProverConfig,
+    ) -> std::io::Result<()> {
+        if self.permutation_polys_mmap.is_some() {
+            return Ok(());
+        }
+        if self.permutation.polys.is_empty() {
+            return Ok(());
+        }
+        let n_per_poly = self.permutation.polys[0].values.len();
+        let polys = std::mem::take(&mut self.permutation.polys);
+        let mm = mmap_pk::spill_vec_to_disk(config.spill_dir.as_deref(), polys, n_per_poly)?;
+        self.permutation_polys_mmap = Some(std::sync::Arc::new(mm));
+        Ok(())
+    }
+
+    /// Spill `fixed_polys`, `fixed_values`, and `permutation.polys` in
+    /// sequence. Each step is independently idempotent. A failure is returned;
+    /// fields converted by earlier steps remain valid mapped storage, so a
+    /// caller retaining the key must deliberately handle the partial result.
+    #[cfg(feature = "disk-spill")]
+    pub(crate) fn spill_all_to_mmap(
+        &mut self,
+        config: &crate::config::ProverConfig,
+    ) -> std::io::Result<()> {
+        self.spill_fixed_polys_to_mmap(config)?;
+        self.spill_fixed_values_to_mmap(config)?;
+        self.spill_permutation_polys_to_mmap(config)?;
+
+        // Drop the cached extended-domain cosets.
+        //
+        // Without this the spill mostly does not work. `ProvingKey::read`
+        // eagerly builds `fixed_cosets` and `permutation::ProvingKey::read`
+        // builds its own — each `4n` per column, and together by far the
+        // largest allocation in a loaded key. Spilling the *polynomials*
+        // while leaving those in place moves the smaller half and reports
+        // success.
+        //
+        // Worse, the prover prefers them when present
+        // (`prover.rs`: `if !pk.fixed_cosets.is_empty()`), so leaving them
+        // also short-circuits the coset spill: a key loaded with both knobs
+        // enabled would keep every coset on the heap and never reach
+        // `build_cosets`.
+        //
+        // They are derived data — `coeff_to_extended` of the polynomials we
+        // just spilled — so dropping them costs a rebuild at prove time,
+        // which is precisely the trade the spill exists to make. Done last,
+        // after the spills have succeeded, so a failure does not discard
+        // them for nothing.
+        //
+        // Not covered by a unit test: constructing a `ProvingKey` requires a
+        // full keygen, which nothing at this level can do cheaply. The
+        // regression this guards against is "someone adds a third cached-coset
+        // collection and does not clear it here", and the honest place to catch
+        // that is an end-to-end assertion on a real key — tracked rather than
+        // faked with a test that would only assert these two fields exist.
+        self.fixed_cosets = Vec::new();
+        self.permutation.cosets = Vec::new();
+        Ok(())
+    }
 }
 
 impl<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitmentScheme<F>> ProvingKey<F, CS>
@@ -354,9 +551,10 @@ where
 
     /// Gets the total number of bytes in the serialization of `self`
     pub fn bytes_length(&self, format: SerdeFormat) -> usize {
+        let fixed_values = self.fixed_values_views();
         self.vk.bytes_length(format)
             + 12 // bytes used for encoding the length(u32) of "l0", "l_last" & "l_active_row" polys
-            + polynomial_slice_byte_length(&self.fixed_values)
+            + polynomial_slice_byte_length(&fixed_values)
             + self.permutation.bytes_length()
     }
 }
@@ -378,7 +576,7 @@ where
     ///   serializing the rest of the data (in the form of field polynomials)
     pub fn write<W: io::Write>(&self, writer: &mut W, format: SerdeFormat) -> io::Result<()> {
         self.vk.write(writer, format)?;
-        write_polynomial_slice(&self.fixed_values, writer)?;
+        write_polynomial_slice(&self.fixed_values_views(), writer)?;
         self.permutation.write(writer)?;
         Ok(())
     }
@@ -403,26 +601,92 @@ where
         format: SerdeFormat,
         #[cfg(feature = "circuit-params")] params: ConcreteCircuit::Params,
     ) -> io::Result<Self> {
+        Self::read_with_policy::<R, ConcreteCircuit>(
+            reader,
+            format,
+            #[cfg(feature = "circuit-params")]
+            params,
+            crate::config::ProverConfig::process(),
+        )
+    }
+
+    /// [`Self::read`] with an explicit memory policy instead of the process
+    /// one.
+    ///
+    /// This is where the policy is *decided*, and it is decided **before** the
+    /// extended-domain cosets are built — not after. The previous order built
+    /// every coset eagerly and only then consulted the policy, so on the path a
+    /// device actually takes the load-time peak was more than double the keygen
+    /// path (1,014 vs 444 MiB at k=16), and enabling the spill made it slightly
+    /// *worse*, because the spill's own transient landed on top of a peak that
+    /// had already been paid. Clearing the cosets afterwards changed the
+    /// steady state and left the peak untouched.
+    ///
+    /// When the policy maps the prover key, the cosets are not built here at
+    /// all. The prover rebuilds them lazily through `build_cosets`, which is
+    /// the path that can spill them — so skipping the eager build is what
+    /// makes the coset spill reachable on load, not merely a memory saving.
+    ///
+    /// Taking the policy as a parameter is what lets a test exercise this
+    /// without mutating process environment, and it is the seam through which
+    /// a per-request policy reaches key loading: a server holding one
+    /// [`ProverContext`](crate::config::ProverContext) per request passes
+    /// `&ctx.config` here and the same context to `create_proof_with`.
+    pub fn read_with_policy<R: io::Read, ConcreteCircuit: Circuit<F>>(
+        reader: &mut R,
+        format: SerdeFormat,
+        #[cfg(feature = "circuit-params")] params: ConcreteCircuit::Params,
+        policy: &crate::config::ProverConfig,
+    ) -> io::Result<Self> {
+        let mut hwm = 0u64;
+        read_stage("start", &mut hwm);
         let vk = VerifyingKey::<F, CS>::read::<R, ConcreteCircuit>(
             reader,
             format,
             #[cfg(feature = "circuit-params")]
             params,
         )?;
+        read_stage("vk read (incl. domain)", &mut hwm);
         let [l0, l_last, l_active_row] = compute_lagrange_polys(&vk, &vk.cs);
+        read_stage("lagrange polys", &mut hwm);
         let fixed_values = read_polynomial_vec(reader, format)?;
+        read_stage("fixed_values read", &mut hwm);
         let fixed_polys: Vec<_> = fixed_values
             .iter()
             .map(|poly| vk.domain.lagrange_to_coeff(poly.clone()))
             .collect();
-        let fixed_cosets = fixed_polys
-            .iter()
-            .map(|poly| vk.domain.coeff_to_extended(poly.clone()))
-            .collect();
-        let permutation =
-            permutation::ProvingKey::read(reader, format, &vk.domain, &vk.cs.permutation)?;
+        read_stage("fixed_polys (ifft)", &mut hwm);
+        // `disk-spill` is the only configuration in which `map_prover_key` can
+        // be honoured; without the feature the eager build is the only path.
+        #[cfg(feature = "disk-spill")]
+        let defer_cosets = policy.map_prover_key;
+        #[cfg(not(feature = "disk-spill"))]
+        let defer_cosets = {
+            let _ = policy;
+            false
+        };
+        let fixed_cosets = if defer_cosets {
+            Vec::new()
+        } else {
+            fixed_polys
+                .iter()
+                .map(|poly| vk.domain.coeff_to_extended(poly.clone()))
+                .collect()
+        };
+        read_stage("fixed_cosets (or deferred)", &mut hwm);
+        let permutation = permutation::ProvingKey::read(
+            reader,
+            format,
+            &vk.domain,
+            &vk.cs.permutation,
+            defer_cosets,
+        )?;
+        read_stage("permutation read", &mut hwm);
         let ev = Evaluator::new(vk.cs());
-        Ok(Self {
+        read_stage("evaluator", &mut hwm);
+        // Only the `disk-spill` path below mutates `pk`.
+        #[cfg_attr(not(feature = "disk-spill"), allow(unused_mut))]
+        let mut pk = Self {
             vk,
             l0,
             l_last,
@@ -432,7 +696,24 @@ where
             fixed_cosets,
             permutation,
             ev,
-        })
+            #[cfg(feature = "disk-spill")]
+            fixed_polys_mmap: None,
+            #[cfg(feature = "disk-spill")]
+            fixed_values_mmap: None,
+            #[cfg(feature = "disk-spill")]
+            permutation_polys_mmap: None,
+        };
+        // Opt-in mmap spill immediately after deserialisation. The default path
+        // remains unchanged. A spill error must reject this load: the move into
+        // a sidecar can already have emptied one or more owned vectors, so
+        // silently returning the partially converted key would be invalid. The
+        // caller can retry the read explicitly with spilling disabled.
+        #[cfg(feature = "disk-spill")]
+        if policy.map_prover_key {
+            pk.spill_all_to_mmap(policy)?;
+        }
+        read_stage("spill (or none)", &mut hwm);
+        Ok(pk)
     }
 
     /// Writes a proving key to a vector of bytes using [`Self::write`].
@@ -461,5 +742,207 @@ impl<F: PrimeField, CS: PolynomialCommitmentScheme<F>> VerifyingKey<F, CS> {
     /// Get the underlying [`EvaluationDomain`].
     pub fn get_domain(&self) -> &EvaluationDomain<F> {
         &self.domain
+    }
+}
+
+#[cfg(all(test, feature = "disk-spill"))]
+mod read_policy_test {
+    //! The load-time peak is decided by *when* the policy is consulted, so this
+    //! drives `read_with_policy` directly. Setting an environment variable here
+    //! would be `unsafe` under Rust 2024 and would race every other test in the
+    //! binary — and it would also test the wrong thing, since the defect was
+    //! never in reading the variable but in reading it too late.
+
+    use midnight_curves::{Bls12, Fq};
+    use rand_core::OsRng;
+
+    use crate::{
+        circuit::SimpleFloorPlanner,
+        config::ProverConfig,
+        plonk::{keygen_pk, keygen_vk_with_k, Circuit, ConstraintSystem, Error, ProvingKey},
+        poly::kzg::{params::ParamsKZG, KZGCommitmentScheme},
+        utils::SerdeFormat,
+    };
+
+    #[derive(Clone, Copy)]
+    struct MyCircuit;
+
+    impl<F: ff::Field> Circuit<F> for MyCircuit {
+        type Config = ();
+        type FloorPlanner = SimpleFloorPlanner;
+        #[cfg(feature = "circuit-params")]
+        type Params = ();
+
+        fn without_witnesses(&self) -> Self {
+            *self
+        }
+
+        fn configure(_meta: &mut ConstraintSystem<F>) -> Self::Config {}
+
+        fn synthesize(
+            &self,
+            _config: Self::Config,
+            _layouter: impl crate::circuit::Layouter<F>,
+        ) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    fn serialised_key() -> Vec<u8> {
+        const K: u32 = 4;
+        let params: ParamsKZG<Bls12> = ParamsKZG::unsafe_setup(K, OsRng);
+        let vk = keygen_vk_with_k::<Fq, KZGCommitmentScheme<Bls12>, _>(&params, &MyCircuit, K)
+            .expect("keygen_vk");
+        keygen_pk(vk, &MyCircuit)
+            .expect("keygen_pk")
+            .to_bytes(SerdeFormat::RawBytesUnchecked)
+    }
+
+    fn read(bytes: &[u8], policy: &ProverConfig) -> ProvingKey<Fq, KZGCommitmentScheme<Bls12>> {
+        ProvingKey::read_with_policy::<_, MyCircuit>(
+            &mut &bytes[..],
+            SerdeFormat::RawBytesUnchecked,
+            #[cfg(feature = "circuit-params")]
+            (),
+            policy,
+        )
+        .expect("read_with_policy")
+    }
+
+    #[test]
+    fn heap_policy_builds_cosets_eagerly_as_upstream_does() {
+        let bytes = serialised_key();
+        let pk = read(&bytes, &ProverConfig::heap());
+        assert!(!pk.fixed_cosets.is_empty() || pk.fixed_polys.is_empty());
+        assert!(pk.fixed_polys_mmap.is_none());
+        assert!(pk.permutation_polys_mmap.is_none());
+    }
+
+    #[test]
+    fn mapped_key_policy_never_builds_the_cosets_it_would_have_to_drop() {
+        // The property that was missing: with the spill requested, the cosets
+        // must not exist at any point during `read`. Asserting they are empty
+        // *after* `read` returns is the strongest observable statement of that
+        // from outside; the old code could not pass it either, because it built
+        // them and cleared them, so an empty result here plus the peak
+        // measurement together pin the behaviour.
+        let bytes = serialised_key();
+        let pk = read(&bytes, &ProverConfig::mapped_key());
+        assert!(
+            pk.fixed_cosets.is_empty(),
+            "fixed cosets must be deferred, not built then dropped"
+        );
+        assert!(
+            pk.permutation.cosets.is_empty(),
+            "permutation cosets must be deferred too"
+        );
+
+        // Whether a sidecar exists depends on whether there was anything to
+        // move: a circuit with no fixed or permutation columns has nothing to
+        // spill, and `spill_*_to_mmap` correctly returns early. Derive the
+        // expectation from the heap-read key rather than hard-coding it, so
+        // the test is right for any fixture and not just this one.
+        let heap = read(&bytes, &ProverConfig::heap());
+        assert_eq!(
+            pk.fixed_polys_mmap.is_some(),
+            !heap.fixed_polys.is_empty(),
+            "fixed polys must be mapped exactly when there were any"
+        );
+        assert_eq!(
+            pk.permutation_polys_mmap.is_some(),
+            !heap.permutation.polys.is_empty(),
+            "permutation polys must be mapped exactly when there were any"
+        );
+        assert!(
+            pk.fixed_polys.is_empty() && pk.permutation.polys.is_empty(),
+            "whatever was mapped must have left the heap vectors"
+        );
+    }
+
+    #[test]
+    fn policy_does_not_change_what_the_key_serialises_to() {
+        // Deferring cosets and mapping storage are about where values live, not
+        // what they are. If the serialised form differed, a key written on a
+        // device with the spill on could not be read by one with it off.
+        let bytes = serialised_key();
+        let heap = read(&bytes, &ProverConfig::heap());
+        let mapped = read(&bytes, &ProverConfig::mapped_key());
+        assert_eq!(
+            heap.to_bytes(SerdeFormat::RawBytesUnchecked),
+            mapped.to_bytes(SerdeFormat::RawBytesUnchecked),
+        );
+        assert_eq!(heap.to_bytes(SerdeFormat::RawBytesUnchecked), bytes);
+    }
+
+    // ---- keygen honours the same policy ---------------------------------
+    //
+    // A key straight out of `keygen_pk` and a key read back from its own bytes
+    // describe the same circuit, so they must hold the same thing. They did
+    // not: `keygen_pk` deferred the cosets in every configuration, including
+    // the heap policy whose documented meaning is upstream's behaviour, so a
+    // generated key rebuilt every fixed and permutation coset on every prove
+    // while a deserialised one did not.
+
+    fn keygen_with(policy: &ProverConfig) -> ProvingKey<Fq, KZGCommitmentScheme<Bls12>> {
+        const K: u32 = 4;
+        let params: ParamsKZG<Bls12> = ParamsKZG::unsafe_setup(K, OsRng);
+        let vk = keygen_vk_with_k::<Fq, KZGCommitmentScheme<Bls12>, _>(&params, &MyCircuit, K)
+            .expect("keygen_vk");
+        crate::plonk::keygen_pk_with_policy(vk, &MyCircuit, policy).expect("keygen_pk")
+    }
+
+    #[test]
+    fn keygen_under_the_heap_policy_holds_what_a_read_key_holds() {
+        let generated = keygen_with(&ProverConfig::heap());
+        let read_back = read(&serialised_key(), &ProverConfig::heap());
+        assert_eq!(
+            generated.fixed_cosets.len(),
+            read_back.fixed_cosets.len(),
+            "a generated key and a deserialised key must agree on fixed cosets"
+        );
+        assert_eq!(
+            generated.permutation.cosets.len(),
+            read_back.permutation.cosets.len(),
+            "and on permutation cosets"
+        );
+        // The load-bearing half: under heap, both are populated whenever the
+        // circuit has columns at all, so no prove pays an extended FFT it was
+        // told it would not.
+        assert_eq!(
+            generated.fixed_cosets.is_empty(),
+            generated.fixed_polys.is_empty(),
+            "heap policy must build a coset per fixed column"
+        );
+        assert_eq!(
+            generated.permutation.cosets.is_empty(),
+            generated.permutation.polys.is_empty(),
+            "heap policy must build a coset per permutation column"
+        );
+    }
+
+    #[test]
+    fn keygen_under_the_mapped_key_policy_defers_its_cosets() {
+        let generated = keygen_with(&ProverConfig::mapped_key());
+        assert!(
+            generated.fixed_cosets.is_empty(),
+            "a mapping policy defers fixed cosets to the prover, which can spill them"
+        );
+        assert!(
+            generated.permutation.cosets.is_empty(),
+            "and the permutation's too"
+        );
+    }
+
+    #[test]
+    fn the_policy_does_not_change_the_generated_key_on_the_wire() {
+        // Cosets are derived, not serialised: the two policies must produce
+        // byte-identical keys, or a device that generates with the spill on
+        // could not hand its key to one that reads with it off.
+        let heap = keygen_with(&ProverConfig::heap());
+        let mapped = keygen_with(&ProverConfig::mapped_key());
+        assert_eq!(
+            heap.to_bytes(SerdeFormat::RawBytesUnchecked),
+            mapped.to_bytes(SerdeFormat::RawBytesUnchecked),
+        );
     }
 }

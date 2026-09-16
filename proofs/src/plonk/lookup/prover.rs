@@ -12,7 +12,7 @@ use crate::{
     plonk::evaluation::evaluate,
     poly::{
         commitment::PolynomialCommitmentScheme, Coeff, EvaluationDomain, LagrangeCoeff, Polynomial,
-        ProverQuery, Rotation,
+        PolynomialView, ProverQuery, Rotation,
     },
     transcript::{Hashable, Transcript},
     utils::arithmetic::{eval_polynomial, parallelize},
@@ -59,7 +59,6 @@ impl<F: WithSmallOrderMulGroup<3> + Ord + Hash> Argument<F> {
         'a,
         'params: 'a,
         CS: PolynomialCommitmentScheme<F>,
-        R: RngCore,
         T: Transcript,
     >(
         &self,
@@ -67,11 +66,11 @@ impl<F: WithSmallOrderMulGroup<3> + Ord + Hash> Argument<F> {
         params: &'params CS::Parameters,
         domain: &EvaluationDomain<F>,
         theta: F,
-        advice_values: &'a [Polynomial<F, LagrangeCoeff>],
-        fixed_values: &'a [Polynomial<F, LagrangeCoeff>],
-        instance_values: &'a [Polynomial<F, LagrangeCoeff>],
+        advice_values: &'a [PolynomialView<'a, F, LagrangeCoeff>],
+        fixed_values: &'a [PolynomialView<'a, F, LagrangeCoeff>],
+        instance_values: &'a [PolynomialView<'a, F, LagrangeCoeff>],
         challenges: &'a [F],
-        mut rng: R,
+        rng: &mut impl RngCore,
         transcript: &mut T,
     ) -> Result<Permuted<F>, Error>
     where
@@ -109,7 +108,7 @@ impl<F: WithSmallOrderMulGroup<3> + Ord + Hash> Argument<F> {
         let (permuted_input_expression, permuted_table_expression) = permute_expression_pair(
             pk,
             domain,
-            &mut rng,
+            rng,
             &compressed_input_expression,
             &compressed_table_expression,
         )?;
@@ -159,7 +158,7 @@ impl<F: WithSmallOrderMulGroup<3>> Permuted<F> {
         params: &CS::Parameters,
         beta: F,
         gamma: F,
-        mut rng: impl RngCore + CryptoRng,
+        rng: &mut (impl RngCore + CryptoRng),
         transcript: &mut T,
     ) -> Result<Committed<F>, Error>
     where
@@ -237,7 +236,7 @@ impl<F: WithSmallOrderMulGroup<3>> Permuted<F> {
             // be a boolean (and ideally 1, else soundness is broken)
             .take(pk.vk.n() as usize - blinding_factors)
             // Chain random blinding factors.
-            .chain((0..blinding_factors).map(|_| F::random(&mut rng)))
+            .chain((0..blinding_factors).map(|_| F::random(&mut *rng)))
             .collect::<Vec<_>>();
         assert_eq!(z.len(), pk.vk.n() as usize);
         let z = pk.vk.domain.lagrange_from_vec(z);
@@ -341,30 +340,27 @@ impl<F: WithSmallOrderMulGroup<3>> Evaluated<F> {
 
         iter::empty()
             // Open lookup product commitments at x
-            .chain(Some(ProverQuery {
-                point: x,
-                poly: &self.constructed.product_poly,
-            }))
+            .chain(Some(ProverQuery::new(x, &self.constructed.product_poly)))
             // Open lookup input commitments at x
-            .chain(Some(ProverQuery {
-                point: x,
-                poly: &self.constructed.permuted_input_poly,
-            }))
+            .chain(Some(ProverQuery::new(
+                x,
+                &self.constructed.permuted_input_poly,
+            )))
             // Open lookup table commitments at x
-            .chain(Some(ProverQuery {
-                point: x,
-                poly: &self.constructed.permuted_table_poly,
-            }))
+            .chain(Some(ProverQuery::new(
+                x,
+                &self.constructed.permuted_table_poly,
+            )))
             // Open lookup input commitments at x_inv
-            .chain(Some(ProverQuery {
-                point: x_inv,
-                poly: &self.constructed.permuted_input_poly,
-            }))
+            .chain(Some(ProverQuery::new(
+                x_inv,
+                &self.constructed.permuted_input_poly,
+            )))
             // Open lookup product commitments at x_next
-            .chain(Some(ProverQuery {
-                point: x_next,
-                poly: &self.constructed.product_poly,
-            }))
+            .chain(Some(ProverQuery::new(
+                x_next,
+                &self.constructed.product_poly,
+            )))
     }
 }
 
@@ -377,10 +373,10 @@ type ExpressionPair<F> = (Polynomial<F, LagrangeCoeff>, Polynomial<F, LagrangeCo
 ///   corresponding value in S'.
 ///
 /// This method returns (A', S') if no errors are encountered.
-fn permute_expression_pair<F, CS: PolynomialCommitmentScheme<F>, R: RngCore>(
+fn permute_expression_pair<F, CS: PolynomialCommitmentScheme<F>>(
     pk: &ProvingKey<F, CS>,
     domain: &EvaluationDomain<F>,
-    mut rng: R,
+    rng: &mut impl RngCore,
     input_expression: &Polynomial<F, LagrangeCoeff>,
     table_expression: &Polynomial<F, LagrangeCoeff>,
 ) -> Result<ExpressionPair<F>, Error>
@@ -435,8 +431,8 @@ where
     }
     assert!(repeated_input_rows.is_empty());
 
-    permuted_input_expression.extend((0..(blinding_factors + 1)).map(|_| F::random(&mut rng)));
-    permuted_table_coeffs.extend((0..(blinding_factors + 1)).map(|_| F::random(&mut rng)));
+    permuted_input_expression.extend((0..(blinding_factors + 1)).map(|_| F::random(&mut *rng)));
+    permuted_table_coeffs.extend((0..(blinding_factors + 1)).map(|_| F::random(&mut *rng)));
     assert_eq!(permuted_input_expression.len(), pk.vk.n() as usize);
     assert_eq!(permuted_table_coeffs.len(), pk.vk.n() as usize);
 

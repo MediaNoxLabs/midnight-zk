@@ -1,6 +1,6 @@
 [package]
 name = "midnight-proofs"
-version = "0.7.0"
+version = "0.7.3"
 edition = "2021"
 rust-version = "1.76.0"
 description = """
@@ -35,7 +35,26 @@ harness = false
 [dependencies]
 ff = { workspace = true }
 group = { workspace = true }
-midnight-curves = "0.2.0"
+midnight-curves = "0.2.1"
+# Memory-mapped SRS support: `read_mmap_arc` constructs a
+# `ParamsKZG` whose `g`/`g_lagrange` are slice views over a file
+# mapping instead of heap Vecs. Saves the ~300 MiB heap
+# allocation for the SRS at k=20 and lets the OS evict cold pages
+# during heavy prove phases. Behind the `mmap` feature so a wasm
+# consumer neither ships the dependency nor can reach a path that
+# needs `mmap(2)`.
+memmap2 = { version = "0.9", optional = true }
+# Disk-backed coset spill at proof-time. `compute_h_poly` opt-in
+# (via MIDNIGHT_SPILL_COSETS=1) writes each extended-domain coset
+# to a tempfile one at a time, drops the in-memory poly, then
+# mmaps the file as a slice view for evaluate_h. Lets multi-GiB
+# extended polynomials never coreside in heap — the unlock for
+# k≥20 on a 6 GiB-limited mobile device. Behind `disk-spill`.
+tempfile = { version = "3", optional = true }
+# Reserve backing-store blocks before a writable spill mapping is touched.
+# Without this, `set_len` may create a sparse file and ENOSPC can surface as
+# SIGBUS during a page fault instead of a recoverable `io::Error`.
+libc = { version = "0.2", optional = true }
 rand_core = { workspace = true, features = ["getrandom"] }
 tracing = { workspace = true }
 blake2b_simd = { workspace = true }
@@ -50,6 +69,8 @@ tabbycat = { version = "0.1", features = ["attributes"], optional = true }
 num-bigint = { workspace = true }
 
 [dev-dependencies]
+# Tests exercise the spill/mmap round trips regardless of feature state.
+tempfile = "3"
 assert_matches = "1.5"
 proptest = "1"
 serde_json = { workspace = true }
@@ -71,7 +92,23 @@ midnight-curves = { version = "0.2.0", features = [
 default = ["committed-instances"]
 circuit-params = []
 derive_serde = ["midnight-curves/serde"]
-dev-curves = ["midnight-curves/serde"]
+dev-curves = ["midnight-curves/serde", "midnight-curves/dev-curves"]
+
+# Host-only prover optimisations. Off by default so a wasm consumer neither
+# ships the dependencies nor can reach code paths that need a filesystem.
+#
+# Capability-shaped rather than one umbrella: the capabilities genuinely
+# differ. WASI has files but no mmap; browser wasm has neither. An umbrella
+# would force a target to take both or neither.
+
+# Map a file into the address space: the SRS companion reader/writer. This
+# also covers the companion *format* — the split-out `.mmap` file that
+# `write_mmap_companion` lays out and `read_mmap_arc` maps back.
+mmap = ["dep:memmap2"]
+
+# Stream polynomials to a tempfile and map them back. Needs `mmap` to read
+# what it wrote, so it enables it rather than duplicating the capability.
+disk-spill = ["mmap", "dep:tempfile", "dep:libc"]
 
 # This feature truncates challenges to half the size of the scalar field.
 truncated-challenges = []

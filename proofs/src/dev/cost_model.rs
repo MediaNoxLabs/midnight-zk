@@ -794,6 +794,281 @@ mod tests {
         assert_eq!(circuit_model::<_, 48, 32>(&circuit).size, proof.len());
     }
 
+    /// A spilled prover key must prove, and the proof must verify — MZK-006's
+    /// real-key regression.
+    ///
+    /// `StandardPlonk` is the right fixture because it has fixed columns and
+    /// equality constraints, so both `fixed_polys` and `permutation.polys`
+    /// actually exist to be spilled; the trivial circuits elsewhere have
+    /// nothing to map and would pass vacuously.
+    ///
+    /// Drives `read_with_policy` directly rather than setting a variable: the
+    /// process policy is `OnceLock`-frozen on first use, and mutating the
+    /// environment from a test is `unsafe` under Rust 2024 and races the rest
+    /// of the binary. This is also the reason MZK-007 exists.
+    #[cfg(feature = "disk-spill")]
+    #[test]
+    fn spilled_key_proves_and_the_proof_verifies() {
+        use crate::{
+            config::ProverConfig,
+            plonk::{parse_trace, verify_algebraic_constraints, ProvingKey},
+            poly::commitment::Guard,
+            utils::SerdeFormat,
+        };
+
+        let k = 9;
+        let circuit = StandardPlonk::<1>(Fq::from(7u64));
+        let params = ParamsKZG::<Bls12>::unsafe_setup(k, OsRng);
+        let vk =
+            keygen_vk_with_k::<_, KZGCommitmentScheme<Bls12>, _>(&params, &circuit, k).expect("vk");
+        let fresh = keygen_pk(vk, &circuit).expect("pk");
+        let bytes = fresh.to_bytes(SerdeFormat::RawBytesUnchecked);
+        drop(fresh);
+
+        let load = |policy: &ProverConfig| {
+            ProvingKey::<Fq, KZGCommitmentScheme<Bls12>>::read_with_policy::<_, StandardPlonk<1>>(
+                &mut &bytes[..],
+                SerdeFormat::RawBytesUnchecked,
+                #[cfg(feature = "circuit-params")]
+                (),
+                policy,
+            )
+            .expect("read_with_policy")
+        };
+
+        // The spilled key: both derived coset caches deferred, both sidecars
+        // present — this fixture genuinely has something to map.
+        let spilled = load(&ProverConfig::mapped_key());
+        assert!(
+            spilled.fixed_cosets.is_empty(),
+            "fixed cosets must be deferred"
+        );
+        assert!(
+            spilled.permutation.cosets.is_empty(),
+            "permutation cosets must be deferred"
+        );
+        assert!(
+            spilled.fixed_polys_mmap.is_some(),
+            "fixed polys must be mapped"
+        );
+        assert!(
+            spilled.permutation_polys_mmap.is_some(),
+            "permutation polys must be mapped"
+        );
+        assert!(spilled.fixed_polys.is_empty() && spilled.permutation.polys.is_empty());
+
+        // And a heap key for the two comparisons below.
+        let heap = load(&ProverConfig::heap());
+        assert_eq!(
+            spilled.to_bytes(SerdeFormat::RawBytesUnchecked),
+            heap.to_bytes(SerdeFormat::RawBytesUnchecked),
+            "where the values live must not change what the key serialises to"
+        );
+
+        let instances: &[&[Fq]] = &[&[circuit.0]];
+        let prove = |pk: &ProvingKey<Fq, KZGCommitmentScheme<Bls12>>| {
+            let mut transcript = CircuitTranscript::<State>::init();
+            create_proof::<Fq, KZGCommitmentScheme<Bls12>, _, _>(
+                &params,
+                pk,
+                std::slice::from_ref(&circuit),
+                #[cfg(feature = "committed-instances")]
+                0,
+                &[instances],
+                OsRng,
+                &mut transcript,
+            )
+            .expect("proof generation");
+            transcript.finalize()
+        };
+        let verify = |vk: &crate::plonk::VerifyingKey<Fq, KZGCommitmentScheme<Bls12>>,
+                      proof: &[u8]| {
+            let mut transcript = CircuitTranscript::<State>::init_from_bytes(proof);
+            // Zero committed instances were used above, so each proof's committed
+            // slice is empty.
+            let trace = parse_trace(
+                vk,
+                #[cfg(feature = "committed-instances")]
+                &[&[]],
+                &[instances],
+                &mut transcript,
+            )
+            .expect("parse_trace");
+            let guard = verify_algebraic_constraints(
+                vk,
+                trace,
+                #[cfg(feature = "committed-instances")]
+                &[&[]],
+                &[instances],
+                &mut transcript,
+            )
+            .expect("algebraic constraints");
+            guard.verify(&params.verifier_params()).expect("opening verification");
+        };
+
+        // The property under test: a proof made from the *spilled* key — fixed
+        // and permutation polynomials read through mapped views, cosets rebuilt
+        // lazily on the spill path — is accepted by the same verifier that
+        // accepts the heap key's proof.
+        verify(spilled.get_vk(), &prove(&spilled));
+        verify(heap.get_vk(), &prove(&heap));
+    }
+
+    /// Two proofs, two contexts, one cancelled: the cancelled one must fail
+    /// with the typed error at its first checkpoint, and the other must not
+    /// notice — it completes, and its proof verifies.
+    ///
+    /// This is the property the process-wide flag could not have: cancelling
+    /// one request cancelled everything. Both proofs run concurrently so the
+    /// test would catch a token that leaked across threads through shared
+    /// state, not just one that leaked within a thread.
+    #[test]
+    fn cancelling_one_proof_leaves_the_other_valid() {
+        use crate::{
+            config::{CancelToken, ProverConfig, ProverContext},
+            plonk::{create_proof_with, parse_trace, verify_algebraic_constraints, Error},
+            poly::commitment::Guard,
+        };
+
+        let k = 9;
+        let circuit = StandardPlonk::<1>(Fq::from(11u64));
+        let params = ParamsKZG::<Bls12>::unsafe_setup(k, OsRng);
+        let vk =
+            keygen_vk_with_k::<_, KZGCommitmentScheme<Bls12>, _>(&params, &circuit, k).expect("vk");
+        let pk = keygen_pk(vk, &circuit).expect("pk");
+        let instances: &[&[Fq]] = &[&[circuit.0]];
+
+        let cancelled = CancelToken::new();
+        cancelled.cancel();
+        let ctx_cancelled = ProverContext::new(ProverConfig::heap()).with_cancel(cancelled);
+        let ctx_live = ProverContext::new(ProverConfig::heap()).with_cancel(CancelToken::new());
+
+        let prove = |ctx: &ProverContext| {
+            let mut transcript = CircuitTranscript::<State>::init();
+            create_proof_with::<Fq, KZGCommitmentScheme<Bls12>, _, _>(
+                ctx,
+                &params,
+                &pk,
+                std::slice::from_ref(&circuit),
+                #[cfg(feature = "committed-instances")]
+                0,
+                &[instances],
+                OsRng,
+                &mut transcript,
+            )
+            .map(|()| transcript.finalize())
+        };
+
+        let (stopped, proved) = std::thread::scope(|s| {
+            let a = s.spawn(|| prove(&ctx_cancelled));
+            let b = s.spawn(|| prove(&ctx_live));
+            (a.join().expect("thread"), b.join().expect("thread"))
+        });
+
+        match stopped {
+            Err(Error::Cancelled { phase }) => assert_eq!(
+                phase, "create_proof.compute_trace.start",
+                "a token set before the call stops at the very first checkpoint"
+            ),
+            other => panic!("expected Error::Cancelled, got {other:?}"),
+        }
+
+        let proof = proved.expect("the uncancelled proof must complete");
+        let mut transcript = CircuitTranscript::<State>::init_from_bytes(&proof);
+        let trace = parse_trace(
+            pk.get_vk(),
+            #[cfg(feature = "committed-instances")]
+            &[&[]],
+            &[instances],
+            &mut transcript,
+        )
+        .expect("parse_trace");
+        verify_algebraic_constraints(
+            pk.get_vk(),
+            trace,
+            #[cfg(feature = "committed-instances")]
+            &[&[]],
+            &[instances],
+            &mut transcript,
+        )
+        .expect("algebraic constraints")
+        .verify(&params.verifier_params())
+        .expect("the uncancelled proof must verify");
+
+        // And key generation is outside cancellation's reach by construction:
+        // it takes no context and has no checkpoint. A cancelled token in the
+        // same process changes nothing about it.
+        let again =
+            keygen_vk_with_k::<_, KZGCommitmentScheme<Bls12>, _>(&params, &circuit, k).expect("vk");
+        keygen_pk(again, &circuit).expect("keygen is not cancellable");
+    }
+
+    /// Failure injection for the key-spill stage: a `spill_dir` that cannot
+    /// hold a tempfile makes the first `spill_*_to_mmap` fail, and the load
+    /// must be rejected outright — an `Err` and no key — because by then an
+    /// owned vector may already have been moved out. Handing back the
+    /// partially converted key was review finding F-019; this pins the fix
+    /// from the caller's side, on a fixture that genuinely has fixed and
+    /// permutation polynomials to spill.
+    ///
+    /// Deferred by MZK-006 because injecting the failure needs `spill_dir`
+    /// per call; the request-scoped policy (MZK-007) made it a plain
+    /// parameter, so no environment is touched.
+    #[cfg(feature = "disk-spill")]
+    #[test]
+    fn a_key_load_whose_spill_directory_does_not_exist_is_rejected_whole() {
+        use crate::{config::ProverConfig, plonk::ProvingKey, utils::SerdeFormat};
+
+        let k = 9;
+        let circuit = StandardPlonk::<1>(Fq::from(5u64));
+        let params = ParamsKZG::<Bls12>::unsafe_setup(k, OsRng);
+        let vk =
+            keygen_vk_with_k::<_, KZGCommitmentScheme<Bls12>, _>(&params, &circuit, k).expect("vk");
+        let fresh = keygen_pk(vk, &circuit).expect("pk");
+        assert!(
+            !fresh.fixed_polys.is_empty(),
+            "the fixture must have something to spill for the injection to reach a spill stage"
+        );
+        let bytes = fresh.to_bytes(SerdeFormat::RawBytesUnchecked);
+
+        let nowhere = std::path::PathBuf::from("/nonexistent-midnight-spill-dir/for-this-test");
+        assert!(!nowhere.exists());
+        let policy = ProverConfig {
+            spill_dir: Some(nowhere),
+            ..ProverConfig::mapped_key()
+        };
+        let result =
+            ProvingKey::<Fq, KZGCommitmentScheme<Bls12>>::read_with_policy::<_, StandardPlonk<1>>(
+                &mut &bytes[..],
+                SerdeFormat::RawBytesUnchecked,
+                #[cfg(feature = "circuit-params")]
+                (),
+                &policy,
+            );
+        match result {
+            Err(e) => {
+                assert_eq!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound,
+                    "the tempfile failure must surface as the io error it was: {e}"
+                );
+                // An operator reading this from a server log must learn which
+                // directory failed and what was attempted there, not just
+                // "No such file or directory" for a file nobody asked for.
+                let text = e.to_string();
+                assert!(
+                    text.contains("/nonexistent-midnight-spill-dir/for-this-test"),
+                    "the error must name the spill directory: {text}"
+                );
+                assert!(
+                    text.contains("create spill temp file"),
+                    "the error must name the operation: {text}"
+                );
+            }
+            Ok(_) => panic!("a failed key spill must reject the load, not hand back a key"),
+        }
+    }
+
     #[test]
     fn check_correct_computation_k() {
         let mut random_byte = [0u8; 1];

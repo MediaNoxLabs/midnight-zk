@@ -3,6 +3,17 @@
 //!
 //! For more details, visit:
 //! https://github.com/midnightntwrk/midnight-ledger-prototype/blob/main/zswap/zswap.compact
+//!
+//! `ZSwap Prover` and `ZSwap Verifier` retain the legacy phase benchmarks.
+//! `ZSwap Prover End-to-end/k=…` measures the normal public prover path under
+//! the policy selected by `MIDNIGHT_SPILL_PK`, `MIDNIGHT_SPILL_COSETS`, and
+//! `MIDNIGHT_SPILL_FLOOR_K`. Run each policy in a separate process and use
+//! Criterion's `--save-baseline`/`--baseline` options for comparisons.
+//!
+//! The separately printed first-proof observation begins after the SRS and
+//! proving key are ready. It is not a process or container cold-start metric.
+use std::{hint::black_box, time::Instant};
+
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 use ff::Field;
 use group::Group;
@@ -19,8 +30,8 @@ use midnight_curves::{Bls12, Fr as JubjubScalar, JubjubExtended as Jubjub, Jubju
 use midnight_proofs::{
     circuit::{Layouter, Value},
     plonk::{
-        bench::prover::benchmark_create_proof, keygen_pk, keygen_vk_with_k, parse_trace,
-        verify_algebraic_constraints, Error,
+        bench::prover::benchmark_create_proof, create_proof, keygen_pk, keygen_vk_with_k,
+        parse_trace, verify_algebraic_constraints, Error,
     },
     poly::{
         commitment::Guard,
@@ -248,15 +259,165 @@ fn sample_zswap_inputs() -> (Vec<F>, MidnightCircuit<'static, ZSwapOutputCircuit
     )
 }
 
+fn flag_enabled(name: &str) -> bool {
+    matches!(std::env::var(name).as_deref(), Ok("1") | Ok("true"))
+}
+
+fn benchmark_memory_profile(k: u32) -> (&'static str, bool) {
+    let spill_pk = flag_enabled("MIDNIGHT_SPILL_PK");
+    let spill_floor = std::env::var("MIDNIGHT_SPILL_FLOOR_K")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(18);
+    let spill_cosets = flag_enabled("MIDNIGHT_SPILL_COSETS") && k >= spill_floor;
+
+    assert!(
+        cfg!(feature = "disk-spill") || !(spill_pk || spill_cosets),
+        "spill flags require the midnight-proofs/disk-spill feature"
+    );
+
+    let name = match (spill_pk, spill_cosets) {
+        (false, false) => "heap",
+        (true, false) => "pk-mmap",
+        (false, true) => "coset-spill",
+        (true, true) => "pk-mmap+coset-spill",
+    };
+    (name, spill_pk)
+}
+
+fn assert_proof_verifies(
+    srs: &ParamsKZG<Bls12>,
+    pk: &midnight_proofs::plonk::ProvingKey<F, KZGCommitmentScheme<Bls12>>,
+    instance: &[F],
+    proof: &[u8],
+) {
+    let mut transcript = CircuitTranscript::<blake2b_simd::State>::init_from_bytes(proof);
+    let trace = parse_trace(
+        pk.get_vk(),
+        &[&[C::identity()]],
+        &[&[instance]],
+        &mut transcript,
+    )
+    .expect("Failed to parse benchmark proof");
+    let guard = verify_algebraic_constraints(
+        pk.get_vk(),
+        trace,
+        &[&[C::identity()]],
+        &[&[instance]],
+        &mut transcript,
+    )
+    .expect("Benchmark proof failed algebraic verification");
+    guard
+        .verify(&srs.verifier_params())
+        .expect("Benchmark proof failed opening verification");
+}
+
 fn bench_zswap_output(c: &mut Criterion) {
-    const K: u32 = 14;
-    let srs = ParamsKZG::unsafe_setup(K, OsRng);
+    let k = std::env::var("MIDNIGHT_BENCH_K")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(14);
+    assert!((9..=25).contains(&k), "MIDNIGHT_BENCH_K must be in 9..=25");
+    let srs = ParamsKZG::unsafe_setup(k, OsRng);
 
     let circuit = MidnightCircuit::from_relation(&ZSwapOutputCircuit);
-    let vk = keygen_vk_with_k::<_, KZGCommitmentScheme<Bls12>, _>(&srs, &circuit, K)
+    let vk = keygen_vk_with_k::<_, KZGCommitmentScheme<Bls12>, _>(&srs, &circuit, k)
         .expect("Failed to generate VK");
     let pk = keygen_pk(vk, &circuit).expect("Failed to generate PK");
     let (instance, circuit) = sample_zswap_inputs();
+    let (memory_profile, spill_pk) = benchmark_memory_profile(k);
+    eprintln!("ZSwap benchmark memory profile: {memory_profile}");
+
+    // Which path prepares the proving key.
+    //
+    // `keygen` is what this benchmark has always measured: a freshly generated
+    // key, spilled in place. `deserialise` is what a device actually does —
+    // serialise the key and load it back through `ProvingKey::read`, where the
+    // spill policy is applied on load. The two were assumed equivalent and are
+    // not: `read` eagerly rebuilds every extended-domain coset before the
+    // policy is consulted, so its load-time peak is a different number from
+    // the keygen path's. Measuring only the keygen path is how that stayed
+    // hidden.
+    let key_path = std::env::var("MIDNIGHT_BENCH_KEY_PATH").unwrap_or_else(|_| "keygen".into());
+    eprintln!("ZSwap benchmark key path: {key_path}");
+    let pk = match key_path.as_str() {
+        "keygen" => {
+            #[cfg(feature = "disk-spill")]
+            let pk = if spill_pk {
+                midnight_proofs::plonk::bench::prover::spill_proving_key(
+                    pk,
+                    midnight_proofs::config::ProverConfig::process(),
+                )
+                .expect("Failed to prepare mmap-backed proving key")
+            } else {
+                pk
+            };
+            #[cfg(not(feature = "disk-spill"))]
+            let _ = spill_pk;
+            pk
+        }
+        "deserialise" => {
+            // `read` applies `ProverConfig::process().map_prover_key` itself, so
+            // the spill (or not) is decided by the same variables as `keygen`.
+            let format = midnight_proofs::utils::SerdeFormat::RawBytesUnchecked;
+            let bytes = pk.to_bytes(format);
+            drop(pk);
+            eprintln!("ZSwap benchmark serialised PK: {} MiB", bytes.len() >> 20);
+            // Stop before reading back. The keygen that produced `bytes` ran in
+            // this same process, and freed memory the allocator retains still
+            // counts as footprint — so without this control, the deserialise
+            // path's peak cannot be separated from keygen's residue. The
+            // difference between this exit and a full `read` is what `read`
+            // adds; if there is barely any, the "2×" was never `read`'s.
+            if flag_enabled("MIDNIGHT_BENCH_STOP_BEFORE_READ") {
+                eprintln!("ZSwap benchmark: stopping before ProvingKey::read as requested");
+                std::process::exit(0);
+            }
+            // `circuit-params` is unified in by a dependency, so `read` needs the
+            // circuit's params; take them from the live circuit rather than
+            // rebuilding them by hand.
+            let params = midnight_proofs::plonk::Circuit::<F>::params(&circuit);
+            midnight_proofs::plonk::ProvingKey::<F, KZGCommitmentScheme<Bls12>>::from_bytes::<
+                MidnightCircuit<'static, ZSwapOutputCircuit>,
+            >(&bytes, format, params)
+            .expect("Failed to deserialise proving key")
+        }
+        other => panic!("MIDNIGHT_BENCH_KEY_PATH must be keygen|deserialise, got {other:?}"),
+    };
+
+    // Stop here when asked. `/usr/bin/time -l` reports the process-wide peak,
+    // and keygen runs before `read` in this same process, so a full proof run
+    // cannot say which phase set the peak. Exiting right after key preparation
+    // makes the peak *of preparing the key* the number reported — and the
+    // difference between the `keygen` and `deserialise` paths is then exactly
+    // what `ProvingKey::read` adds on top of generating the same key.
+    if flag_enabled("MIDNIGHT_BENCH_STOP_AFTER_KEY") {
+        eprintln!("ZSwap benchmark: stopping after key preparation as requested");
+        std::process::exit(0);
+    }
+
+    // This is intentionally a one-shot observation rather than a Criterion
+    // distribution. It starts after the SRS and proving key are ready, so it
+    // must not be confused with process/container cold start. Keeping it ahead
+    // of the legacy phase benchmark prevents that benchmark from warming every
+    // prover path before the first-proof number is captured.
+    let mut first_proof = CircuitTranscript::<blake2b_simd::State>::init();
+    let first_proof_started = Instant::now();
+    create_proof(
+        &srs,
+        &pk,
+        std::slice::from_ref(&circuit),
+        1,
+        &[&[&[], &instance]],
+        OsRng,
+        &mut first_proof,
+    )
+    .expect("First-proof observation failed to generate a proof");
+    let first_proof_elapsed = first_proof_started.elapsed();
+    assert_proof_verifies(&srs, &pk, &instance, &first_proof.finalize());
+    eprintln!(
+        "ZSwap first proof after key ready: k={k}, profile={memory_profile}, elapsed={first_proof_elapsed:?}"
+    );
 
     let mut group = c.benchmark_group("ZSwap Prover");
     let mut transcript = CircuitTranscript::<blake2b_simd::State>::init();
@@ -266,7 +427,7 @@ fn bench_zswap_output(c: &mut Criterion) {
         &[circuit.clone()],
         1,
         &[&[&[], &instance]],
-        OsRng,
+        &mut OsRng,
         &mut transcript,
         &mut group,
     )
@@ -327,6 +488,36 @@ fn bench_zswap_output(c: &mut Criterion) {
             BatchSize::SmallInput,
         )
     });
+    group.finish();
+
+    // Unlike the legacy phase benchmark above, this measures the public,
+    // end-to-end prover entry point. The line emitted above records which of
+    // the production flags selected heap or mmap/spill storage for this process.
+    // Run heap and spill in separate invocations: changing process-wide
+    // environment variables between Criterion samples would be racy and would
+    // produce an untrustworthy comparison.
+    let mut group = c.benchmark_group(format!("ZSwap Prover End-to-end/k={k}"));
+    group.sample_size(10);
+    group.bench_function("steady-state-proof", |b| {
+        b.iter_batched(
+            CircuitTranscript::<blake2b_simd::State>::init,
+            |mut transcript| {
+                create_proof(
+                    &srs,
+                    &pk,
+                    std::slice::from_ref(&circuit),
+                    1,
+                    &[&[&[], &instance]],
+                    OsRng,
+                    &mut transcript,
+                )
+                .expect("End-to-end benchmark failed to generate a proof");
+                black_box(transcript.finalize())
+            },
+            BatchSize::SmallInput,
+        )
+    });
+    group.finish();
 }
 
 criterion_group!(

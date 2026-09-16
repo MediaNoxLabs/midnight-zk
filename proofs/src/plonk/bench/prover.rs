@@ -3,6 +3,8 @@
 use std::hash::Hash;
 
 use criterion::BenchmarkGroup;
+#[cfg(feature = "disk-spill")]
+use ff::PrimeField;
 use ff::{FromUniformBytes, WithSmallOrderMulGroup};
 use rand_core::{CryptoRng, RngCore};
 
@@ -17,7 +19,7 @@ use crate::{
         traces::ProverTrace,
         trash, vanishing, Error, ProvingKey,
     },
-    poly::commitment::PolynomialCommitmentScheme,
+    poly::{commitment::PolynomialCommitmentScheme, polynomial_views},
     transcript::{Hashable, Sampleable, Transcript},
 };
 
@@ -44,7 +46,7 @@ pub(crate) fn compute_trace<
     // instances that the verifier receives in committed form.
     #[cfg(feature = "committed-instances")] nb_committed_instances: usize,
     instances: &[&[&[F]]],
-    mut rng: impl RngCore + CryptoRng,
+    rng: &mut (impl RngCore + CryptoRng),
     transcript: &mut T,
     group: &mut BenchmarkGroup<criterion::measurement::WallTime>,
 ) -> Result<ProverTrace<F>, Error>
@@ -112,13 +114,13 @@ where
                 || transcript.clone(),
                 |mut t| {
                     let _ = parse_advices::<F, CS, ConcreteCircuit, T>(
-                        params, pk, circuits, instances, &mut t, &mut rng,
+                        params, pk, circuits, instances, &mut t, rng,
                     );
                 },
                 criterion::BatchSize::LargeInput,
             )
         });
-        parse_advices(params, pk, circuits, instances, transcript, &mut rng)?
+        parse_advices(params, pk, circuits, instances, transcript, rng)?
     };
 
     // Sample theta challenge for keeping lookup columns linearly independent
@@ -144,11 +146,11 @@ where
                                         params,
                                         domain,
                                         theta,
-                                        &advice.advice_polys,
-                                        &pk.fixed_values,
-                                        &instance.instance_values,
+                                        &polynomial_views(&advice.advice_polys),
+                                        &pk.fixed_values_views(),
+                                        &polynomial_views(&instance.instance_values),
                                         &challenges,
-                                        &mut rng,
+                                        rng,
                                         &mut t,
                                     )
                                 })
@@ -174,11 +176,11 @@ where
                             params,
                             domain,
                             theta,
-                            &advice.advice_polys,
-                            &pk.fixed_values,
-                            &instance.instance_values,
+                            &polynomial_views(&advice.advice_polys),
+                            &pk.fixed_values_views(),
+                            &polynomial_views(&instance.instance_values),
                             &challenges,
-                            &mut rng,
+                            rng,
                             transcript,
                         )
                     })
@@ -207,12 +209,12 @@ where
                                 params,
                                 pk,
                                 &pk.permutation,
-                                &advice.advice_polys,
-                                &pk.fixed_values,
-                                &instance.instance_values,
+                                &polynomial_views(&advice.advice_polys),
+                                &pk.fixed_values_views(),
+                                &polynomial_views(&instance.instance_values),
                                 beta,
                                 gamma,
-                                &mut rng,
+                                rng,
                                 &mut t,
                             )
                         })
@@ -229,12 +231,12 @@ where
                     params,
                     pk,
                     &pk.permutation,
-                    &advice.advice_polys,
-                    &pk.fixed_values,
-                    &instance.instance_values,
+                    &polynomial_views(&advice.advice_polys),
+                    &pk.fixed_values_views(),
+                    &polynomial_views(&instance.instance_values),
                     beta,
                     gamma,
-                    &mut rng,
+                    rng,
                     transcript,
                 )
             })
@@ -253,7 +255,7 @@ where
                             lookups
                                 .into_iter()
                                 .map(|lookup| {
-                                    lookup.commit_product(pk, params, beta, gamma, &mut rng, &mut t)
+                                    lookup.commit_product(pk, params, beta, gamma, rng, &mut t)
                                 })
                                 .collect::<Result<Vec<_>, _>>()
                         })
@@ -268,9 +270,7 @@ where
                 // Construct and commit to products for each lookup
                 lookups
                     .into_iter()
-                    .map(|lookup| {
-                        lookup.commit_product(pk, params, beta, gamma, &mut rng, transcript)
-                    })
+                    .map(|lookup| lookup.commit_product(pk, params, beta, gamma, rng, transcript))
                     .collect::<Result<Vec<_>, _>>()
             })
             .collect::<Result<Vec<_>, _>>()?
@@ -297,9 +297,9 @@ where
                                         params,
                                         domain,
                                         trash_challenge,
-                                        &advice.advice_polys,
-                                        &pk.fixed_values,
-                                        &instance.instance_values,
+                                        &polynomial_views(&advice.advice_polys),
+                                        &pk.fixed_values_views(),
+                                        &polynomial_views(&instance.instance_values),
                                         &challenges,
                                         &mut t,
                                     )
@@ -324,9 +324,9 @@ where
                             params,
                             domain,
                             trash_challenge,
-                            &advice.advice_polys,
-                            &pk.fixed_values,
-                            &instance.instance_values,
+                            &polynomial_views(&advice.advice_polys),
+                            &pk.fixed_values_views(),
+                            &polynomial_views(&instance.instance_values),
                             &challenges,
                             transcript,
                         )
@@ -341,12 +341,12 @@ where
         b.iter_batched(
             || transcript.clone(),
             |mut t| {
-                let _ = vanishing::Argument::<F, CS>::commit(params, domain, &mut rng, &mut t);
+                let _ = vanishing::Argument::<F, CS>::commit(params, domain, rng, &mut t);
             },
             criterion::BatchSize::SmallInput,
         )
     });
-    let vanishing = vanishing::Argument::<F, CS>::commit(params, domain, &mut rng, transcript)?;
+    let vanishing = vanishing::Argument::<F, CS>::commit(params, domain, rng, transcript)?;
 
     // Obtain challenge for keeping all separate gates linearly independent
     let y: F = transcript.squeeze_challenge();
@@ -396,6 +396,7 @@ pub(crate) fn finalise_proof<'a, F, CS: PolynomialCommitmentScheme<F>, T: Transc
     // instances that the verifier receives in committed form.
     #[cfg(feature = "committed-instances")] nb_committed_instances: usize,
     trace: ProverTrace<F>,
+    rng: &mut (impl RngCore + CryptoRng),
     transcript: &mut T,
     group: &mut BenchmarkGroup<criterion::measurement::WallTime>,
 ) -> Result<(), Error>
@@ -413,13 +414,16 @@ where
 
     let domain = pk.get_vk().get_domain();
 
+    // The benchmark measures the process policy — that is what the
+    // environment-driven harness sets up.
+    let config = crate::config::ProverConfig::process();
     let h_poly = {
         group.bench_function("Compute H poly", |b| {
             b.iter(|| {
-                let _ = compute_h_poly(pk, &trace);
+                let _ = compute_h_poly(pk, &trace, config);
             })
         });
-        compute_h_poly(pk, &trace)
+        compute_h_poly(pk, &trace, config)
     };
 
     let ProverTrace {
@@ -438,12 +442,12 @@ where
             b.iter_batched(
                 || (transcript.clone(), h_poly.clone(), vanishing.clone()),
                 |(mut t, h, v)| {
-                    let _ = v.construct::<CS, T>(params, domain, h, &mut t);
+                    let _ = v.construct::<CS, T>(params, domain, h, rng, &mut t);
                 },
                 criterion::BatchSize::PerIteration,
             )
         });
-        vanishing.construct::<CS, T>(params, domain, h_poly, transcript)?
+        vanishing.construct::<CS, T>(params, domain, h_poly, rng, transcript)?
     };
 
     let x: F = transcript.squeeze_challenge();
@@ -487,16 +491,17 @@ where
     };
 
     // Evaluate common permutation data
+    let permutation_polys = pk.permutation_polys_views();
     group.bench_function("Evaluate permutation data", |b| {
         b.iter_batched(
             || transcript.clone(),
             |mut t| {
-                let _ = pk.permutation.evaluate(x, &mut t);
+                let _ = pk.permutation.evaluate(&permutation_polys, x, &mut t);
             },
             criterion::BatchSize::SmallInput,
         )
     });
-    pk.permutation.evaluate(x, transcript)?;
+    pk.permutation.evaluate(&permutation_polys, x, transcript)?;
 
     // Evaluate the permutations, if any, at omega^i x.
     let permutations: Vec<permutation::prover::Evaluated<F>> = permutations
@@ -567,6 +572,37 @@ where
     CS::multi_open(params, &queries, transcript).map_err(|_| Error::ConstraintSystemFailure)
 }
 
+/// Moves the proving-key polynomials into their mmap-backed representation.
+///
+/// This is exposed only with the benchmark API: production consumers select
+/// the same path while deserializing a key with `MIDNIGHT_SPILL_PK=1`, whereas
+/// a benchmark already owns a freshly generated key and needs to prepare it
+/// without including a serialize/read cycle in the measurement.
+///
+/// # Why this consumes the key
+///
+/// The spill's whole memory benefit is that each polynomial is freed as soon as
+/// it has been written, so a failure partway through has already dropped the
+/// ones before it. There is no state to roll back to.
+///
+/// Taking `pk` by value and returning it only on success makes that
+/// unobservable: a failed spill yields an `Err` and no key, rather than an
+/// `Err` beside a key whose fixed polynomials are silently empty. The earlier
+/// `&mut` signature left exactly that — and the emptied field reads back as an
+/// empty slice, so the next proof would be built from nothing.
+#[cfg(feature = "disk-spill")]
+pub fn spill_proving_key<F, CS>(
+    mut pk: ProvingKey<F, CS>,
+    config: &crate::config::ProverConfig,
+) -> std::io::Result<ProvingKey<F, CS>>
+where
+    F: PrimeField,
+    CS: PolynomialCommitmentScheme<F>,
+{
+    pk.spill_all_to_mmap(config)?;
+    Ok(pk)
+}
+
 /// Benchmarked version of proof creation that measures each internal step.
 ///
 /// This function simply calls `compute_trace` and `finalise_proof` with the
@@ -584,7 +620,7 @@ pub fn benchmark_create_proof<
     circuits: &[ConcreteCircuit],
     #[cfg(feature = "committed-instances")] nb_committed_instances: usize,
     instances: &[&[&[F]]],
-    rng: impl RngCore + CryptoRng,
+    rng: &mut (impl RngCore + CryptoRng),
     transcript: &mut T,
     group: &mut BenchmarkGroup<criterion::measurement::WallTime>,
 ) -> Result<(), Error>
@@ -618,6 +654,7 @@ where
         #[cfg(feature = "committed-instances")]
         nb_committed_instances,
         trace,
+        rng,
         transcript,
         group,
     )
