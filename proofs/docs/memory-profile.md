@@ -78,6 +78,17 @@ Three independent capabilities, each off by default.
 temporary file and drops it before building the next, then maps the file back.
 Peak transient heap becomes roughly one coset rather than all of them.
 
+The cosets are only *deferred* — left unbuilt for the prover to materialise
+lazily — when the policy maps the prover key, because that is the path that can
+spill them. Both entry points apply the same condition:
+`ProvingKey::read_with_policy` on load, and `keygen_pk_with_policy` (which
+`keygen_pk` calls with the process policy) on generation. Under
+`ProverConfig::heap` both build every coset eagerly, so a key from keygen and a
+key read back from its own bytes hold the same thing and prove at the same
+speed. Deferring in keygen unconditionally — which is what it used to do — made
+every prove from a freshly generated key pay one extended FFT per fixed and
+permutation column, under a policy documented as upstream's behaviour.
+
 All three are behind `mmap` and `disk-spill` features, off by default, and the
 policy is a value — `config::ProverConfig` — not a set of environment reads.
 A `config::ProverContext` carries that value plus an optional `CancelToken`
@@ -128,7 +139,12 @@ because spilling has to map back what it wrote.
   heap and logs; under `bench-internal` it panics, so a benchmark cannot
   measure the heap arm and call it a spill. Backing store is preallocated
   (`posix_fallocate`, `F_PREALLOCATE`) so ENOSPC surfaces as an `io::Error`
-  rather than a SIGBUS during a page fault.
+  rather than a SIGBUS during a page fault. Where the filesystem has no
+  preallocation call at all — musl, ZFS, NFS, many FUSE mounts — the reservation
+  falls back to writing the file out in zeroed blocks, which is slower and gives
+  the same guarantee; only a genuine shortage of space fails. Rejecting the key
+  load because the filesystem lacked a syscall was a portability failure
+  reported as a resource failure.
 - **The companion file is a local cache, not an interchange format.** Its
   header is validated — magic, version, a layout identity over (curve type,
   point size, alignment, `k`), offsets, counts, alignment — with every length

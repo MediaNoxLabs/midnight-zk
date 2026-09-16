@@ -7,8 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Added
+* `keygen_pk_with_policy`: generate a proving key under an explicit
+  `ProverConfig`, the same seam `ProvingKey::read_with_policy` gives key
+  loading. `keygen_pk` calls it with the process policy, so existing callers
+  are unaffected.
+* Memory-mapped SRS and prover key, disk-spilled extended-domain cosets, and a
+  request-scoped `ProverConfig` / `ProverContext` / `CancelToken`, all behind
+  the `mmap` and `disk-spill` features and off by default. See
+  `docs/memory-profile.md`.
 
 ### Changed
+* **`keygen_pk` no longer defers the extended-domain cosets under every
+  policy.** It deferred them unconditionally, so a key from keygen and a key
+  read back from its own bytes disagreed: every prove from a generated key paid
+  one extended FFT per fixed and per permutation column, including under
+  `ProverConfig::heap`, whose documented meaning is upstream's behaviour. The
+  deferral now follows the same condition `read_with_policy` applies.
+* **The blstrs MSM fast-path gate is per target.** It was raised from `2^18` to
+  `2^21` for every architecture, but the measurement behind the raise was
+  aarch64-only and the comment beside it records an x86 regression above
+  `2^18`. x86 keeps `2^18`; aarch64 keeps `2^21`. The chunked-Pippenger arm is
+  reachable again below `2^21` on x86.
+* **A filesystem without a preallocation syscall no longer fails the key
+  load.** `posix_fallocate` / `F_PREALLOCATE` returning "unsupported" — musl,
+  ZFS, NFS, many FUSE mounts — falls back to writing the spill out in zeroed
+  blocks, which gives the same SIGBUS guarantee more slowly. A genuine shortage
+  of space still fails.
 
 ### Removed
 

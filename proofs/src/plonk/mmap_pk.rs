@@ -127,6 +127,49 @@ fn make_tempfile(spill_dir: Option<&std::path::Path>) -> io::Result<std::fs::Fil
     }
 }
 
+/// Whether a preallocation error means "this filesystem cannot preallocate"
+/// rather than "there is no room".
+///
+/// `posix_fallocate` and `F_PREALLOCATE` are not universally implemented:
+/// musl, ZFS, NFS and many FUSE filesystems reject them outright. Treating
+/// that as fatal made the whole key load fail on hosts with plenty of free
+/// space — a portability failure reported as a resource failure. Out of space
+/// is different in kind and still fails: falling back there would write the
+/// zero-fill until the volume filled, which is the SIGBUS this function
+/// exists to prevent, only later.
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn preallocation_unsupported(errno: i32) -> bool {
+    matches!(
+        errno,
+        libc::EOPNOTSUPP | libc::ENOSYS | libc::EINVAL | libc::ENOTTY | libc::EPERM
+    )
+}
+
+/// Write the whole file out in zeroed blocks.
+///
+/// Portable and intentionally slower: every block is written, so an allocation
+/// failure surfaces as an `io::Error` here rather than as a SIGBUS when the
+/// mapping is later faulted in. This is the only path on platforms without a
+/// preallocation syscall, and the fallback on platforms whose filesystem
+/// refuses one.
+fn zero_fill_spill_file(file: &mut std::fs::File, total_bytes: usize) -> io::Result<()> {
+    use io::Write as _;
+
+    // A `static`, not a `const`: a const of this size is materialised at each
+    // use site (clippy's `large_const_arrays`), and one shared zero page-run is
+    // exactly what a zero-fill wants.
+    static ZERO_BLOCK: [u8; 1024 * 1024] = [0; 1024 * 1024];
+    file.set_len(0)?;
+    let mut remaining = total_bytes;
+    while remaining != 0 {
+        let n = remaining.min(ZERO_BLOCK.len());
+        file.write_all(&ZERO_BLOCK[..n])?;
+        remaining -= n;
+    }
+    file.flush()?;
+    Ok(())
+}
+
 /// Ensure the spill has real backing store before a writable mapping can
 /// fault pages in. Merely extending the file can create a sparse file; on a
 /// full volume, writing that mapping may then terminate the process with
@@ -148,6 +191,13 @@ fn reserve_spill_file(file: &mut std::fs::File, total_bytes: usize) -> io::Resul
         #[allow(unsafe_code)]
         let status = unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, allocation_len) };
         if status != 0 {
+            if preallocation_unsupported(status) {
+                tracing::debug!(
+                    errno = status,
+                    "posix_fallocate is unsupported on this filesystem; zero-filling the spill"
+                );
+                return zero_fill_spill_file(file, total_bytes);
+            }
             return Err(io::Error::from_raw_os_error(status));
         }
         file.set_len(file_len)?;
@@ -185,9 +235,22 @@ fn reserve_spill_file(file: &mut std::fs::File, total_bytes: usize) -> io::Resul
             }
         }
         if status == -1 {
-            return Err(io::Error::last_os_error());
+            let err = io::Error::last_os_error();
+            if err.raw_os_error().is_some_and(preallocation_unsupported) {
+                tracing::debug!(
+                    errno = err.raw_os_error(),
+                    "F_PREALLOCATE is unsupported on this filesystem; zero-filling the spill"
+                );
+                return zero_fill_spill_file(file, total_bytes);
+            }
+            return Err(err);
         }
         if store.fst_bytesalloc < allocation_len {
+            // A short reservation is a space problem, not a support problem:
+            // both `F_PREALLOCATE` attempts above are all-or-nothing, so
+            // reaching here means the volume could not give us the extents.
+            // Zero-filling would only discover the same shortage later, from
+            // inside a mapping.
             return Err(io::Error::other(
                 "filesystem did not reserve the complete spill",
             ));
@@ -198,18 +261,8 @@ fn reserve_spill_file(file: &mut std::fs::File, total_bytes: usize) -> io::Resul
 
     #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
     {
-        // Portable, intentionally slower fallback: writing every block makes
-        // allocation failure recoverable before the mapping is created.
-        const ZERO_BLOCK: [u8; 1024 * 1024] = [0; 1024 * 1024];
-        file.set_len(0)?;
-        let mut remaining = total_bytes;
-        while remaining != 0 {
-            let n = remaining.min(ZERO_BLOCK.len());
-            file.write_all(&ZERO_BLOCK[..n])?;
-            remaining -= n;
-        }
-        file.flush()?;
-        Ok(())
+        let _ = file_len;
+        zero_fill_spill_file(file, total_bytes)
     }
 }
 
