@@ -873,4 +873,76 @@ mod read_policy_test {
         );
         assert_eq!(heap.to_bytes(SerdeFormat::RawBytesUnchecked), bytes);
     }
+
+    // ---- keygen honours the same policy ---------------------------------
+    //
+    // A key straight out of `keygen_pk` and a key read back from its own bytes
+    // describe the same circuit, so they must hold the same thing. They did
+    // not: `keygen_pk` deferred the cosets in every configuration, including
+    // the heap policy whose documented meaning is upstream's behaviour, so a
+    // generated key rebuilt every fixed and permutation coset on every prove
+    // while a deserialised one did not.
+
+    fn keygen_with(policy: &ProverConfig) -> ProvingKey<Fq, KZGCommitmentScheme<Bls12>> {
+        const K: u32 = 4;
+        let params: ParamsKZG<Bls12> = ParamsKZG::unsafe_setup(K, OsRng);
+        let vk = keygen_vk_with_k::<Fq, KZGCommitmentScheme<Bls12>, _>(&params, &MyCircuit, K)
+            .expect("keygen_vk");
+        crate::plonk::keygen_pk_with_policy(vk, &MyCircuit, policy).expect("keygen_pk")
+    }
+
+    #[test]
+    fn keygen_under_the_heap_policy_holds_what_a_read_key_holds() {
+        let generated = keygen_with(&ProverConfig::heap());
+        let read_back = read(&serialised_key(), &ProverConfig::heap());
+        assert_eq!(
+            generated.fixed_cosets.len(),
+            read_back.fixed_cosets.len(),
+            "a generated key and a deserialised key must agree on fixed cosets"
+        );
+        assert_eq!(
+            generated.permutation.cosets.len(),
+            read_back.permutation.cosets.len(),
+            "and on permutation cosets"
+        );
+        // The load-bearing half: under heap, both are populated whenever the
+        // circuit has columns at all, so no prove pays an extended FFT it was
+        // told it would not.
+        assert_eq!(
+            generated.fixed_cosets.is_empty(),
+            generated.fixed_polys.is_empty(),
+            "heap policy must build a coset per fixed column"
+        );
+        assert_eq!(
+            generated.permutation.cosets.is_empty(),
+            generated.permutation.polys.is_empty(),
+            "heap policy must build a coset per permutation column"
+        );
+    }
+
+    #[test]
+    fn keygen_under_the_mapped_key_policy_defers_its_cosets() {
+        let generated = keygen_with(&ProverConfig::mapped_key());
+        assert!(
+            generated.fixed_cosets.is_empty(),
+            "a mapping policy defers fixed cosets to the prover, which can spill them"
+        );
+        assert!(
+            generated.permutation.cosets.is_empty(),
+            "and the permutation's too"
+        );
+    }
+
+    #[test]
+    fn the_policy_does_not_change_the_generated_key_on_the_wire() {
+        // Cosets are derived, not serialised: the two policies must produce
+        // byte-identical keys, or a device that generates with the spill on
+        // could not hand its key to one that reads with it off.
+        let heap = keygen_with(&ProverConfig::heap());
+        let mapped = keygen_with(&ProverConfig::mapped_key());
+        assert_eq!(
+            heap.to_bytes(SerdeFormat::RawBytesUnchecked),
+            mapped.to_bytes(SerdeFormat::RawBytesUnchecked),
+        );
+    }
 }

@@ -290,10 +290,41 @@ where
     ))
 }
 
-/// Generate a `ProvingKey` from a `VerifyingKey` and an instance of `Circuit`.
+/// Generate a `ProvingKey` from a `VerifyingKey` and an instance of `Circuit`,
+/// under the process-wide memory policy.
+///
+/// Equivalent to [`keygen_pk_with_policy`] with
+/// [`ProverConfig::process`](crate::config::ProverConfig::process) — the
+/// environment's policy, read once. Callers that hold a per-request
+/// [`ProverContext`](crate::config::ProverContext) should pass its config to
+/// [`keygen_pk_with_policy`] instead, the same way they pass it to
+/// [`ProvingKey::read_with_policy`](crate::plonk::ProvingKey::read_with_policy)
+/// and `create_proof_with`.
 pub fn keygen_pk<F, CS, ConcreteCircuit>(
     vk: VerifyingKey<F, CS>,
     circuit: &ConcreteCircuit,
+) -> Result<ProvingKey<F, CS>, Error>
+where
+    F: WithSmallOrderMulGroup<3>,
+    CS: PolynomialCommitmentScheme<F>,
+    ConcreteCircuit: Circuit<F>,
+{
+    keygen_pk_with_policy(vk, circuit, crate::config::ProverConfig::process())
+}
+
+/// Generate a `ProvingKey` under an explicit memory policy.
+///
+/// The policy decides one thing here: whether the extended-domain cosets —
+/// `fixed_cosets` and the permutation's — are built now or deferred to the
+/// prover, which materialises them lazily through `build_cosets` and can spill
+/// them to a mapped file. The condition is the same one
+/// [`ProvingKey::read_with_policy`](crate::plonk::ProvingKey::read_with_policy)
+/// uses, so a generated key and a deserialised key of the same circuit agree
+/// on their contents and therefore on prove time.
+pub fn keygen_pk_with_policy<F, CS, ConcreteCircuit>(
+    vk: VerifyingKey<F, CS>,
+    circuit: &ConcreteCircuit,
+    policy: &crate::config::ProverConfig,
 ) -> Result<ProvingKey<F, CS>, Error>
 where
     F: WithSmallOrderMulGroup<3>,
@@ -339,22 +370,43 @@ where
         fixed.par_iter().map(|poly| vk.domain.lagrange_to_coeff(poly.clone())).collect();
     crate::plonk::prover::log_phase_pub("keygen_pk.fixed_polys.end");
 
-    // Defer fixed_cosets construction to per-prove. They're only
-    // consumed inside `compute_h_poly`'s `evaluate_h` call; building
-    // them once per prove and dropping immediately after means they
-    // never coreside with the rest of the prove's working set
-    // (multi_open MSM scratch, h_pieces, advice columns in extended
-    // form, etc.) — peak drops by ~size_of(fixed_cosets) which at
-    // k=20 is ~600 MiB.
+    // Under a policy that maps the prover key, defer `fixed_cosets` to
+    // per-prove. They are only consumed inside `compute_h_poly`'s `evaluate_h`
+    // call; building them once per prove and dropping immediately after means
+    // they never coreside with the rest of the prove's working set (multi_open
+    // MSM scratch, h_pieces, advice columns in extended form, etc.) — peak
+    // drops by ~size_of(fixed_cosets), which at k=20 is ~600 MiB.
     //
-    // Trade: every prove pays the extended-FFT cost for each fixed
-    // column. ~10ms × column count at k=18 on a fast desktop;
-    // dozens of seconds at k=20 on mobile. Per the project brief,
-    // memory beats CPU.
-    let fixed_cosets: Vec<_> = Vec::new();
+    // Trade: every prove then pays the extended-FFT cost for each fixed
+    // column. ~10 ms × column count at k=18 on a fast desktop; dozens of
+    // seconds at k=20 on mobile. That is the right trade when memory is the
+    // binding constraint and the wrong one otherwise, which is why it follows
+    // the policy rather than being unconditional — and why the condition is
+    // the same one `ProvingKey::read_with_policy` applies, so a generated key
+    // and a deserialised one hold the same thing.
+    //
+    // `disk-spill` is the only configuration in which `map_prover_key` can be
+    // honoured; without the feature the eager build is the only path.
+    #[cfg(feature = "disk-spill")]
+    let defer_cosets = policy.map_prover_key;
+    #[cfg(not(feature = "disk-spill"))]
+    let defer_cosets = {
+        let _ = policy;
+        false
+    };
+
+    let fixed_cosets: Vec<_> = if defer_cosets {
+        Vec::new()
+    } else {
+        fixed_polys
+            .par_iter()
+            .map(|poly| vk.domain.coeff_to_extended(poly.clone()))
+            .collect()
+    };
     crate::plonk::prover::log_phase_pub("keygen_pk.fixed_cosets.end");
 
-    let permutation_pk = assembly.permutation.build_pk::<F>(&vk.domain, &cs.permutation);
+    let permutation_pk =
+        assembly.permutation.build_pk::<F>(&vk.domain, &cs.permutation, defer_cosets);
     crate::plonk::prover::log_phase_pub("keygen_pk.permutation_pk.end");
 
     let [l0, l_last, l_active_row] = compute_lagrange_polys(&vk, &cs);

@@ -118,8 +118,9 @@ impl Assembly {
         self,
         domain: &EvaluationDomain<F>,
         p: &Argument,
+        defer_cosets: bool,
     ) -> ProvingKey<F> {
-        build_pk::<_>(domain, p, |i, j| self.mapping[i][j])
+        build_pk::<_>(domain, p, defer_cosets, |i, j| self.mapping[i][j])
     }
 
     /// Returns columns that participate in the permutation argument.
@@ -138,6 +139,7 @@ impl Assembly {
 pub(crate) fn build_pk<F: WithSmallOrderMulGroup<3>>(
     domain: &EvaluationDomain<F>,
     p: &Argument,
+    defer_cosets: bool,
     mapping: impl Fn(usize, usize) -> (usize, usize) + Sync,
 ) -> ProvingKey<F> {
     // Compute [omega^0, omega^1, ..., omega^{params.n - 1}]
@@ -182,26 +184,24 @@ pub(crate) fn build_pk<F: WithSmallOrderMulGroup<3>>(
         });
     }
 
-    // Compute the coefficient-form polys eagerly (~`n_cols × n × 32 B`)
-    // but defer the extended-domain cosets — they're only consumed
-    // inside `compute_h_poly::evaluate_h` and can be lazily
-    // materialised + dropped within that scope. Saves
-    // `~n_cols × 4n × 32 B` keygen-resident heap; at k=20 that's
-    // hundreds of MiB. See the same pattern applied to
-    // `fixed_cosets` in `plonk::keygen::keygen_pk` for the
-    // architectural rationale.
-    let polys = {
-        let mut polys = vec![domain.empty_coeff(); p.columns.len()];
-        crate::utils::arithmetic::parallelize(&mut polys, |o, start| {
-            for (x, poly) in o.iter_mut().enumerate() {
-                let i = start + x;
-                let permutation_poly = permutations[i].clone();
-                *poly = domain.lagrange_to_coeff(permutation_poly);
-            }
-        });
-        polys
+    // `defer_cosets` mirrors `permutation::ProvingKey::read`: under a policy
+    // that maps the prover key, the extended-domain cosets are not built here
+    // at all — they are only consumed inside `compute_h_poly::evaluate_h`, and
+    // the prover materialises them lazily through `build_cosets`, which is the
+    // path that can spill them. That saves `~n_cols × 4n × 32 B` of
+    // keygen-resident heap (hundreds of MiB at k=20) and, more importantly,
+    // is what makes the spill reachable at all.
+    //
+    // Under the default heap policy they are built here, exactly as a
+    // deserialised key builds them, so a key from `keygen_pk` and a key from
+    // `ProvingKey::read` prove at the same speed. Deferring unconditionally
+    // made every prove from a freshly generated key pay an extended FFT per
+    // column, on a policy whose documented meaning is "upstream's behaviour".
+    let (polys, cosets) = if defer_cosets {
+        (compute_polys::<F>(domain, p, &permutations), Vec::new())
+    } else {
+        compute_polys_and_cosets::<F>(domain, p, &permutations)
     };
-    let cosets: Vec<_> = Vec::new();
 
     ProvingKey {
         permutations,
